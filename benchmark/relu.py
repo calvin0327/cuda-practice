@@ -2,25 +2,9 @@ import time
 from typing import Optional
 
 import torch
-from torch.utils.cpp_extension import load
+from ops import ops
 
 torch.set_grad_enabled(False)
-
-lib = load(
-    name="relu_lib",
-    sources=["relu.cu"],
-    extra_cuda_cflags=[
-        "-O3",
-        "-U__CUDA_NO_HALF_OPERATORS__",
-        "-U__CUDA_NO_HALF_CONVERSIONS__",
-        "-U__CUDA_NO_HALF2_OPERATORS__",
-        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-        "--expt-relaxed-constexpr",
-        "--expt-extended-lambda",
-        "--use_fast_math",
-    ],
-    extra_cflags=["-std=c++17"],
-)
 
 
 def run_benchmark(
@@ -81,4 +65,5 @@ for S, K in SKs:
     print(" " * 40 + f"S={S}, K={K}")
     x = torch.randn((S, K)).cuda().float().contiguous()
     y = torch.zeros_like(x).cuda().float().contiguous()
-    run_benchmark(lib.relu_f32, x, "f32", y)
+    run_benchmark(ops.relu_f32, x, "f32", y)
+    run_benchmark(ops.relu_f32x4, x, "f32x4", y)

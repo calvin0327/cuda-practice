@@ -99,9 +99,14 @@ def run_benchmark(
     return out, mean_time
 
 
-Ms = [4096, 8192, 16384]
-Ns = [4096, 8192, 16384]
-Ks = [2048, 4096, 8192]
+# Ms = [4096, 8192, 16384]
+# Ns = [4096, 8192, 16384]
+# Ks = [2048, 4096, 8192]
+
+Ms = [4096, 8192]
+Ns = [4096, 8192]
+Ks = [2048, 4096]
+
 MAX_M, MAX_N, MAX_K = 16384, 16384, 8192
 # pre allocate for fast profiling.
 A = torch.randn((MAX_M, MAX_K), dtype=torch.float).cuda()
@@ -120,7 +125,12 @@ for M, N, K in MNKs:
     torch.cuda.synchronize()
 
     # CUDA Cores FP32
-    # run_benchmark(lib.sgemm_naive_f32, a, b, "f32(naive)", c)
     run_benchmark(ops.sgemm_naive_f32, a, b, "sgemm_naive_f32", c)
+    torch.cuda.synchronize()
+    print("-" * 130)
+    run_benchmark(ops.sgemm_shared_f32, a, b, "sgemm_shared_f32", c)
+    torch.cuda.synchronize()
+    print("-" * 130)
+    run_benchmark(ops.sgemm_t_8x8_shared_f32x4, a, b, "sgemm_t_8x8_shared_f32x4", c)
     torch.cuda.synchronize()
     print("-" * 130)
