@@ -2,25 +2,10 @@ import time
 from typing import Optional
 
 import torch
-from torch.utils.cpp_extension import load
+from ops import ops
 
 torch.set_grad_enabled(False)
 
-lib = load(
-    name="elu_lib",
-    sources=["elu.cu"],
-    extra_cuda_cflags=[
-        "-O3",
-        "-U__CUDA_NO_HALF_OPERATORS__",
-        "-U__CUDA_NO_HALF_CONVERSIONS__",
-        "-U__CUDA_NO_HALF2_OPERATORS__",
-        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-        "--expt-relaxed-constexpr",
-        "--expt-extended-lambda",
-        "--use_fast_math",
-    ],
-    extra_cflags=["-std=c++17"],
-)
 
 def run_benchmark(
     perf_func: callable,
@@ -79,4 +64,9 @@ for S, K in SKs:
     print(" " * 40 + f"S={S}, K={K}")
     x = torch.randn((S, K)).cuda().float().contiguous()
     y = torch.zeros_like(x).cuda().float().contiguous()
-    run_benchmark(lib.elu_f32, x, "f32", y)
+    run_benchmark(ops.elu_f32, x, "f32", y)
+    print("-" * 85)
+    x_f16 = x.half().contiguous()
+    y_f16 = y.half().contiguous()
+    run_benchmark(ops.elu_f16, x_f16, "f16", y_f16)
+    print("-" * 85)
