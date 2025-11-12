@@ -7,7 +7,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
-#include "utils.h"
+#include "../utils.h"
 
 #define ALPHA 1.0f
 

@@ -53,16 +53,11 @@ def get_extensions():
     extensions_dir = os.path.join(this_dir, "csrc")
     sources = list(glob.glob(os.path.join(extensions_dir, "*.cpp")))
 
-    cuda_sources = list(glob.glob(os.path.join(extensions_dir, "*.cu")))
-    hgemm_dir = os.path.join(extensions_dir, "hgemm")
-    hgemm_sources = list(glob.glob(os.path.join(hgemm_dir, "*.cu")))
-    sgemm_dir = os.path.join(extensions_dir, "sgemm")
-    sgemm_sources = list(glob.glob(os.path.join(sgemm_dir, "*.cu")))
+    cuda_dir = os.path.join(extensions_dir, "cuda")
+    cuda_sources = list(glob.glob(os.path.join(cuda_dir, "*.cu")))
 
     if use_cuda:
         sources += cuda_sources
-        sources += hgemm_sources
-        sources += sgemm_sources
 
     ext_modules = [
         extension(

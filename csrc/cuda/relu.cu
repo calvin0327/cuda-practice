@@ -8,7 +8,7 @@
 #include <cuda_runtime.h>
 #include <cuda.h>
 
-#include "utils.h"
+#include "../utils.h"
 
 #define FLOAT4(value) (reinterpret_cast<float4*>(&(value))[0])
 
