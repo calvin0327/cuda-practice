@@ -1,6 +1,7 @@
 #include <cuda.h>
 #include <stdlib.h>
 #include "util.h"
+#include <cute/tensor.hpp>
 
 template <class ProblemShape, class CtaTiler, class TA, class AStride,
           class ASmemLayout, class AThreadLayout, class TB, class BStride,
@@ -92,14 +93,17 @@ __global__ static __launch_bounds__(decltype(size(
   Tensor sA = make_tensor(make_smem_ptr(smemA), sA_layout);  // (BLK_M,BLK_K)
   Tensor sB = make_tensor(make_smem_ptr(smemB), sB_layout);  // (BLK_N,BLK_K)
 
-    // Define thread layouts (static)
-  auto tC = make_layout(make_shape(Int<16>{}, Int<16>{}));   // (m,n) -> thr_idx; m-major
-    static_assert(is_static<CThreadLayout>::value);
+  // Define thread layouts (static)
+  auto tC = make_layout(
+      make_shape(Int<16>{}, Int<16>{}));  // (m,n) -> thr_idx; m-major
+  static_assert(is_static<CThreadLayout>::value);
 
-  CUTE_STATIC_ASSERT_V(size(tC) == size(tA));                          // NumThreads
+  CUTE_STATIC_ASSERT_V(size(tC) == size(tA));  // NumThreads
 
-  CUTE_STATIC_ASSERT_V(size<0>(cta_tiler) % size<0>(tC) == Int<0>{});  // BLK_M / THR_M
-  CUTE_STATIC_ASSERT_V(size<1>(cta_tiler) % size<1>(tC) == Int<0>{});  // BLK_N / THR_N
+  CUTE_STATIC_ASSERT_V(size<0>(cta_tiler) % size<0>(tC) ==
+                       Int<0>{});  // BLK_M / THR_M
+  CUTE_STATIC_ASSERT_V(size<1>(cta_tiler) % size<1>(tC) ==
+                       Int<0>{});  // BLK_N / THR_N
 
   // TUTORIAL: Example of a very simple compute mainloop
   //   copy(.) operates on the global and shared memory via the tA|tB

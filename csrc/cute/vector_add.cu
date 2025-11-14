@@ -7,13 +7,13 @@
 #include "../utils.h"
 
 template <int kNumElemPerThread = 8>
-__global__ vector_add_kernel(half* z, half* x, half* y, int num, const half a,
-                             const half b, const half c) {
+__global__ void vector_add_kernel(half* z, half* x, half* y, int num,
+                                  const half a, const half b, const half c) {
   using namespace cute;
 
   int tid = blockDim.x * blockIdx.x + threadIdx.x;
   if (tid > num / kNumElemPerThread) {
-    return
+    return;
   }
 
   auto gZ = make_tensor(make_gmem_ptr(z), make_shape(num));

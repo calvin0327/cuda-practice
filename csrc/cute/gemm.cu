@@ -1,6 +1,9 @@
 #include <cuda.h>
 #include <stdlib.h>
 #include "util.h"
+#include <cute/tensor.hpp>
+
+using namespace cute;
 
 template <typename T>
 void gen_rand_data(T* data, int n);
@@ -79,9 +82,9 @@ int main() {
   cudaMemcpy(Aptr, Aptr_host, sizeof(T) * m * k, cudaMemcpyHostToDevice);
   cudaMemcpy(Bptr, Bptr_host, sizeof(T) * n * k, cudaMemcpyHostToDevice);
 
-  using mma_op = SM80_16x8x16_F16F16F16F16_TN;
-  using mma_traits = MMA_Traints<mma_op>;
-  using mma_atom = MMA_Atom<mma_traints>;
+  using mma_op = cute::SM80_16x8x16_F16F16F16F16_TN;
+  using mma_traits = cute::MMA_Traits<mma_op>;
+  using mma_atom = cute::MMA_Atom<mma_traits>;
 
   using MMA =
       decltype(make_tiled_mma(mma_atom{}, make_layout(Shape<_2, _2, _1>{}),
@@ -92,6 +95,7 @@ int main() {
   constexpr int kTileK = 32;
 
   dim3 block(size(MMA{}));
+  print(size(MMA{}));
   dim3 grid(n / kTileN, m / kTileM);
   cudaEventRecord(start);
   gemm_kernel<T, kTileM, kTileN, kTileK, MMA>
