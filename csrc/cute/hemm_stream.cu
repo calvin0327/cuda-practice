@@ -13,13 +13,13 @@
 // Setup params for an NT HEMM
 template <class T, class ProblemShape, class CtaTiler,  //
           class TiledCopyA, class TiledCopyB, class TiledMma>
-__global__ void gemm_f16_tiled_copy_128x8_t16x16_kernel(T* C, T const* A,
-                                                        T const* B,  // data
-                                                        ProblemShape shape_MNK,
-                                                        CtaTiler cta_tiler,
-                                                        TiledCopyA tiled_copy_a,
-                                                        TiledCopyB tiled_copy_b,
-                                                        TiledMma tiled_mma) {
+__global__ void gemm_f16_stream_128x8_t16x16_kernel(T* C, T const* A,
+                                                    T const* B,  // data
+                                                    ProblemShape shape_MNK,
+                                                    CtaTiler cta_tiler,
+                                                    TiledCopyA tiled_copy_a,
+                                                    TiledCopyB tiled_copy_b,
+                                                    TiledMma tiled_mma) {
   using namespace cute;
 
   CUTE_STATIC_ASSERT_V(rank(shape_MNK) == Int<3>{});
@@ -52,15 +52,26 @@ __global__ void gemm_f16_tiled_copy_128x8_t16x16_kernel(T* C, T const* A,
   ThrCopy thr_copy_a = tiled_copy_a.get_slice(threadIdx.x);
   Tensor tAgA = thr_copy_a.partition_S(gA);
   Tensor tAsA = thr_copy_a.partition_D(sA);
+  // Allocate registers same shape/layout as partitioned data
+  Tensor tArA = make_fragment_like(tAsA);
 
   ThrCopy thr_copy_b = tiled_copy_b.get_slice(threadIdx.x);
   Tensor tBgB = thr_copy_b.partition_S(gB);
   Tensor tBsB = thr_copy_b.partition_D(sB);
+  // Allocate registers same shape/layout as partitioned data
+  Tensor tBrB = make_fragment_like(tBsB);
 
   CUTE_STATIC_ASSERT_V(size<1>(tAgA) == size<1>(tAsA));  // CPY_M
+  CUTE_STATIC_ASSERT_V(size<1>(tAgA) == size<1>(tArA));  // CPY_M
   CUTE_STATIC_ASSERT_V(size<2>(tAgA) == size<2>(tAsA));  // CPY_K
+  CUTE_STATIC_ASSERT_V(size<2>(tAgA) == size<2>(tArA));  // CPY_K
   CUTE_STATIC_ASSERT_V(size<1>(tBgB) == size<1>(tBsB));  // CPY_N
+  CUTE_STATIC_ASSERT_V(size<1>(tBgB) == size<1>(tBrB));  // CPY_N
   CUTE_STATIC_ASSERT_V(size<2>(tBgB) == size<2>(tBsB));  // CPY_K
+  CUTE_STATIC_ASSERT_V(size<2>(tBgB) == size<2>(tBrB));  // CPY_K
+
+  copy(tiled_copy_a, tAgA(_, _, _, 0), tArA);
+  copy(tiled_copy_b, tBgB(_, _, _, 0), tBrB);
 
   ThrMMA thr_mma = tiled_mma.get_slice(threadIdx.x);
   Tensor tCsA = thr_mma.partition_A(sA);
@@ -79,8 +90,16 @@ __global__ void gemm_f16_tiled_copy_128x8_t16x16_kernel(T* C, T const* A,
 
   auto K_TILE_MAX = size<3>(tAgA);
   for (int k_tile = 0; k_tile < K_TILE_MAX; ++k_tile) {
-    copy(tAgA(_, _, _, k_tile), tAsA);
-    copy(tBgB(_, _, _, k_tile), tBsB);
+    __syncthreads();
+    copy(tArA, tAsA);
+    copy(tBrB, tBsB);
+    __syncthreads();
+
+    // Copy gmem to rmem for k_tile+1 with tA|tB thread-partitioned tensors
+    int k_tile_next = (k_tile + 1 < K_TILE_MAX) ? k_tile + 1 : k_tile;
+    copy(copy_a, tAgA(_, _, _, k_tile_next), tArA);
+    copy(copy_b, tBgB(_, _, _, k_tile_next), tBrB);
+
     __syncthreads();  // Wait for all threads to write
 
     // Compute gemm on tC thread-partitioned smem
@@ -152,7 +171,7 @@ int main() {
 
   dim3 block(16 * 16);
   dim3 grid(size(ceil_div(M, bM)), size(ceil_div(N, bN)));
-  gemm_f16_tiled_copy_128x8_t16x16_kernel<<<grid, block, 0, 0>>>(
+  gemm_f16_stream_128x8_t16x16_kernel<<<grid, block, 0, 0>>>(
       d_C.data().get(), d_A.data().get(), d_B.data().get(),  // data
       proble_shape, cta_tiler, copyA, copyB, mmaC);
 
