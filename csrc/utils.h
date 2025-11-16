@@ -19,3 +19,15 @@
     TORCH_CHECK(error == cutlass::Status::kSuccess, \
                 cutlassGetStatusString(error));     \
   }
+
+#define CUTE_PRINT(name, content) \
+  print(name);                    \
+  print(" : ");                   \
+  print(content);                 \
+  print("\n");
+
+#define CUTE_PRINTTENSOR(name, content) \
+  print(name);                          \
+  print(" : ");                         \
+  print_tensor(content);                \
+  print("\n");

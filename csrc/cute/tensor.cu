@@ -9,6 +9,20 @@ using namespace cute;
 
 void fundamemtal_operations();
 void nonowning_tensors();
+__global__ void owning_tensors();
+
+int main() {
+  print("----------fundamemtal_operations----------\n");
+  fundamemtal_operations();
+
+  print("------------nonowning_tensors-------------\n");
+  nonowning_tensors();
+
+  print("-------------owning_tensors---------------\n");
+  dim3 block(1);
+  dim3 grid(1);
+  owning_tensors<<<grid, block>>>();
+}
 
 __global__ void owning_tensors() {
   // Shared memory (static or dynamic layouts)
@@ -38,20 +52,6 @@ __global__ void owning_tensors() {
   print(rmem_4x8_like);
   print("\n");
 }
-
-int main() {
-  print("----------fundamemtal_operations----------\n");
-  fundamemtal_operations();
-
-  print("------------nonowning_tensors-------------\n");
-  nonowning_tensors();
-
-  print("-------------owning_tensors---------------\n");
-  dim3 block(1);
-  dim3 grid(1);
-  owning_tensors<<<grid, block>>>();
-}
-
 void fundamemtal_operations() {
   float* A = new float[8]{0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f, 0.7f, 0.8f};
 

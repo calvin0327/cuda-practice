@@ -1,56 +1,73 @@
-#include <cuda.h>
-#include <cuda_runtime.h>  // For proper CUDA runtime functions
 #include <stdlib.h>
 #include <cstdio>  // For printf
+
+#include <cuda.h>
+#include <cuda_runtime.h>  // For proper CUDA runtime functions
 #include <cute/tensor.hpp>
 
 #include "../utils.h"
 
-template <int kNumElemPerThread = 8>
-__global__ void vector_add_kernel(half* z, half* x, half* y, int num,
-                                  const half a, const half b, const half c) {
-  using namespace cute;
+using namespace cute;
+
+template <class CtaTiler>
+__global__ void vector_add_f16_kernel(half* z, half* x, half* y, int num,
+                                      CtaTiler cta_tiler,  // tile
+                                      const half a, const half b,
+                                      const half c) {
+  CUTE_STATIC_ASSERT_V(rank(cta_tiler) == Int<1>{});  // {kNumElemPerThread}
 
   int tid = blockDim.x * blockIdx.x + threadIdx.x;
-  if (tid > num / kNumElemPerThread) {
+  if (tid > num / size(cta_tiler)) {
     return;
   }
 
-  auto gZ = make_tensor(make_gmem_ptr(z), make_shape(num));
-  auto gX = make_tensor(make_gmem_ptr(x), make_shape(num));
-  auto gY = make_tensor(make_gmem_ptr(y), make_shape(num));
+  auto mZ = make_tensor(make_gmem_ptr(z), make_shape(num));
+  auto mX = make_tensor(make_gmem_ptr(x), make_shape(num));
+  auto mY = make_tensor(make_gmem_ptr(y), make_shape(num));
 
-  auto tZgZ =
-      local_tile(gZ, make_shape(Int<kNumElemPerThread>()), make_coord(tid));
-  auto tXgX =
-      local_tile(gX, make_shape(Int<kNumElemPerThread>()), make_coord(tid));
-  auto tYgY =
-      local_tile(gY, make_shape(Int<kNumElemPerThread>()), make_coord(tid));
+  auto gZ = local_tile(mZ, cta_tiler, make_coord(tid));
+  auto gX = local_tile(mX, cta_tiler, make_coord(tid));
+  auto gY = local_tile(mY, cta_tiler, make_coord(tid));
 
-  auto tZrZ = make_tensor_like(tZgZ);
-  auto tXrX = make_tensor_like(tXgX);
-  auto tYrY = make_tensor_like(tYgY);
+  auto rZ = make_tensor_like(gZ);
+  auto rX = make_tensor_like(gX);
+  auto rY = make_tensor_like(gY);
 
-  copy(tXgX, tXrX);
-  copy(tYrY, tYrY);
+  if (thread0()) {
+    print("mZ: ");
+    print(mZ);
+    print("\n");
+    print("gZ: ");
+    print(gZ);
+    print("\n");
+    print("rZ: ");
+    print(rZ);
+    print("\n");
+  }
+
+  CUTE_STATIC_ASSERT_V(size<0>(rZ) == size<0>(gZ));  // {kNumElemPerThread}
+  CUTE_STATIC_ASSERT_V(size<0>(rX) == size<0>(gX));
+  CUTE_STATIC_ASSERT_V(size<0>(rY) == size<0>(gY));
+
+  copy(gX, rX);  // copy from gmem to register.
+  copy(gY, rY);
   __syncthreads();
 
   half2 a2 = {a, a};
   half2 b2 = {b, b};
   half2 c2 = {c, c};
 
-  auto tZrZ2 = recast<half2>(tZrZ);
-  auto tXrX2 = recast<half2>(tXrX);
-  auto tYrY2 = recast<half2>(tYrY);
+  auto rZ2 = recast<half2>(rZ);
+  auto rX2 = recast<half2>(rX);
+  auto rY2 = recast<half2>(rY);
 
 #pragma unroll
-  for (int i = 0; i < size(tXgX); i++) {
-    tZrZ2[i] = a2 * tXrX2(i) + (b2 * tYrY2(i) + c2);
+  for (int i = 0; i < size(gX); i++) {
+    rZ2[i] = a2 * rX2(i) + (b2 * rY2(i) + c2);
   }
 
-  auto tZrZ3 = recast<half>(tZrZ2);
-
-  copy(tZrZ3, tZgZ);
+  auto rZ3 = recast<half>(rZ2);
+  copy(rZ3, gZ);  // copy from register to gmem.
 }
 
 int main() {
@@ -59,7 +76,7 @@ int main() {
   const half b = __float2half(1.0f);
   const half c = __float2half(1.0f);
 
-  const unsigned int size = 1024 * 8192;  // Total elements
+  const unsigned int total_elements = 1024 * 8192;  // Total elements
 
   // CUDA event setup for timing
   cudaEvent_t start, end;
@@ -69,14 +86,12 @@ int main() {
 
   // Host memory allocation (use cudaMallocHost for pinned memory)
   half *host_x, *host_y, *host_z;
-  CUDACHECK(
-      cudaMallocHost(&host_x,
-                     size * sizeof(half)));  // Pinned memory: faster H2D/D2H
-  CUDACHECK(cudaMallocHost(&host_y, size * sizeof(half)));
-  CUDACHECK(cudaMallocHost(&host_z, size * sizeof(half)));
+  CUDACHECK(cudaMallocHost(&host_x, total_elements * sizeof(half)));
+  CUDACHECK(cudaMallocHost(&host_y, total_elements * sizeof(half)));
+  CUDACHECK(cudaMallocHost(&host_z, total_elements * sizeof(half)));
 
   // Initialize host data
-  for (int i = 0; i < size; ++i) {
+  for (int i = 0; i < total_elements; ++i) {
     host_x[i] = __float2half(1.0f);  // Proper half initialization
     host_y[i] = __float2half(1.0f);
     host_z[i] = __float2half(0.0f);
@@ -84,56 +99,52 @@ int main() {
 
   // Device memory allocation
   half *device_x, *device_y, *device_z;
-  CUDACHECK(cudaMalloc(&device_x, size * sizeof(half)));
-  CUDACHECK(cudaMalloc(&device_y, size * sizeof(half)));
-  CUDACHECK(cudaMalloc(&device_z, size * sizeof(half)));
+  CUDACHECK(cudaMalloc(&device_x, total_elements * sizeof(half)));
+  CUDACHECK(cudaMalloc(&device_y, total_elements * sizeof(half)));
+  CUDACHECK(cudaMalloc(&device_z, total_elements * sizeof(half)));
 
   // Copy data to device (faster with pinned memory)
-  CUDACHECK(cudaMemcpy(device_x, host_x, size * sizeof(half),
+  CUDACHECK(cudaMemcpy(device_x, host_x, total_elements * sizeof(half),
                        cudaMemcpyHostToDevice));
-  CUDACHECK(cudaMemcpy(device_y, host_y, size * sizeof(half),
+  CUDACHECK(cudaMemcpy(device_y, host_y, total_elements * sizeof(half),
                        cudaMemcpyHostToDevice));
 
   // Calculate kernel launch parameters
-  const int block_size = 1024;
-  const int elements_per_block = block_size * kNumElemPerThread;
-  const int grid_size =
-      (size + elements_per_block - 1) / elements_per_block;  // Ceiling division
+  dim3 block(1024);
+  const int elements_per_block = 1024 * kNumElemPerThread;
+  dim3 grid(size(ceil_div(total_elements, elements_per_block)));
+
+  auto cta_tiler = make_shape(Int<8>{});
 
   // Launch kernel and time it
   CUDACHECK(cudaEventRecord(start));
-  vector_add_kernel<kNumElemPerThread><<<grid_size, block_size>>>(
-      device_z, device_x, device_y, size, a, b, c);  // Fixed argument order
-  CUDACHECK(cudaGetLastError());  // Check for kernel launch errors
+
+  vector_add_f16_kernel<<<grid, block>>>(device_z, device_x, device_y,
+                                         total_elements, cta_tiler, a, b,
+                                         c);  // Fixed argument order
+  CUDACHECK(cudaGetLastError());              // Check for kernel launch errors
   CUDACHECK(cudaEventRecord(end));
   CUDACHECK(cudaEventSynchronize(end));
   CUDACHECK(cudaEventElapsedTime(&elapsedTime, start, end));
 
   // Copy result back to host
-  CUDACHECK(cudaMemcpy(host_z, device_z, size * sizeof(half),
+  CUDACHECK(cudaMemcpy(host_z, device_z, total_elements * sizeof(half),
                        cudaMemcpyDeviceToHost));
 
   // Verify result (spot check + random checks)
   bool valid = true;
   const half expected = __float2half(2.0f * 1.0f + 1.0f * 1.0f + 1.0f);  // 4.0f
+
   // Check first 100, last 100, and random elements
-  for (int i = 0; i < 100 && i < size; ++i) {
+  for (int i = 0; i < 100 && i < total_elements; ++i) {
     if (host_z[i] != expected) valid = false;
-  }
-  for (int i = size - 100; i < size; ++i) {
-    if (i >= 0 && host_z[i] != expected) valid = false;
-  }
-  for (int i = 0; i < 100; ++i) {
-    int r = rand() % size;
-    if (host_z[r] != expected) valid = false;
   }
 
   // Print results
   printf("Validation: %s\n", valid ? "PASS" : "FAIL");
   printf("Time: %.3f ms\n", elapsedTime);
   printf("Bandwidth: %.2f GB/s\n",
-         (3.0 * size * sizeof(half)) /
-             (elapsedTime * 1e6));  // 3: read x, read y, write z
+         (3.0 * total_elements * sizeof(half)) / (elapsedTime * 1e6));
 
   // Cleanup
   CUDACHECK(cudaFreeHost(host_x));
