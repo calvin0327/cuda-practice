@@ -12,7 +12,7 @@
 
 // Setup params for an NT HEMM
 template <class T, class ProblemShape, class CtaTiler>
-__global__ void gemm_f16_sliced_128x8_t16x16_kernel(T* C, T const* A,
+__global__ void gemm_f16_tiled_128x8_t16x16_kernel(T* C, T const* A,
                                                     T const* B,
                                                     ProblemShape shape_MNK,
                                                     CtaTiler cta_tiler) {
@@ -38,11 +38,11 @@ __global__ void gemm_f16_sliced_128x8_t16x16_kernel(T* C, T const* A,
   Tensor mC = make_tensor(make_gmem_ptr(C),
                           make_layout(select<0, 1>(shape_MNK)));  // M-major
 
-  // if (thread0()) {
-  // CUTE_PRINT("mA layout", mA.layout());
-  // CUTE_PRINT("mB layout", mB.layout());
-  // CUTE_PRINT("mC layout", mC.layout());
-  // }
+  if (thread0()) {
+    CUTE_PRINT("mA layout", mA.layout());
+    // CUTE_PRINT("mB layout", mB.layout());
+    CUTE_PRINT("mC layout", mC.layout());
+  }
 
   // tiled A, B, C, cta_tiler is (128, 128, 8)
   auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);  // (M, N, K)
@@ -50,11 +50,11 @@ __global__ void gemm_f16_sliced_128x8_t16x16_kernel(T* C, T const* A,
   Tensor gB = local_tile(mB, cta_tiler, cta_coord, Step<X, _1, _1>());
   Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1, _1, X>());
 
-  // if (thread0()) {
-  // CUTE_PRINT("gA layout", gA.layout());
-  // CUTE_PRINT("gB layout", gB.layout());
-  // CUTE_PRINT("gC layout", gC.layout());
-  // }
+  if (thread0()) {
+    CUTE_PRINT("gA layout", gA.layout());
+    CUTE_PRINT("gB layout", gB.layout());
+    CUTE_PRINT("gC layout", gC.layout());
+  }
 
   // smemA_size is 128 * 8, smemB_size is 128 * 8
   constexpr auto smemA_size = size<0>(cta_tiler) * size<2>(cta_tiler);
@@ -67,10 +67,10 @@ __global__ void gemm_f16_sliced_128x8_t16x16_kernel(T* C, T const* A,
   Tensor sB = make_tensor(make_smem_ptr(smemB),
                           make_layout(select<1, 2>(cta_tiler)));  // n-major
 
-  // if (thread0()) {
-  // CUTE_PRINT("sA layout", sA.layout());
-  // CUTE_PRINT("sB layout", sB.layout());
-  // }
+  if (thread0()) {
+    CUTE_PRINT("sA layout", sA.layout());
+    CUTE_PRINT("sB layout", sB.layout());
+  }
 
   // load 4 elements peer threa -> (128 * 8) / (32 * 8)
   auto load_thr_tile = make_layout(make_shape(Int<32>{}, Int<8>{}));
@@ -80,12 +80,12 @@ __global__ void gemm_f16_sliced_128x8_t16x16_kernel(T* C, T const* A,
   Tensor tBgB = local_partition(gB, load_thr_tile, threadIdx.x);
   Tensor tBsB = local_partition(sB, load_thr_tile, threadIdx.x);
 
-  // if (thread0()) {
-  // CUTE_PRINT("tAgA layout", tAgA.layout());
-  // CUTE_PRINT("tAsA layout", tAsA.layout());
-  // CUTE_PRINT("tBgB layout", tBgB.layout());
-  // CUTE_PRINT("tBsB layout", tBsB.layout());
-  // }
+  if (thread0()) {
+    CUTE_PRINT("tAgA layout", tAgA.layout());
+    CUTE_PRINT("tAsA layout", tAsA.layout());
+    CUTE_PRINT("tBgB layout", tBgB.layout());
+    CUTE_PRINT("tBsB layout", tBsB.layout());
+  }
 
   CUTE_STATIC_ASSERT_V(size<0>(tAgA) == size<0>(tAsA));  // Thr_m
   CUTE_STATIC_ASSERT_V(size<1>(tAgA) == size<1>(tAsA));  // Thr_k
@@ -103,12 +103,12 @@ __global__ void gemm_f16_sliced_128x8_t16x16_kernel(T* C, T const* A,
 
   auto tCrC = make_tensor_like(tCgC);
 
-  // if (thread0()) {
-  // CUTE_PRINT("tCsA layout", tCsA.layout());
-  // CUTE_PRINT("tCsB layout", tCsB.layout());
-  // CUTE_PRINT("tCgC layout", tCgC.layout());
-  // CUTE_PRINT("tCrC layout", tCrC.layout());
-  // }
+  if (thread0()) {
+    CUTE_PRINT("tCsA layout", tCsA.layout());
+    CUTE_PRINT("tCsB layout", tCsB.layout());
+    CUTE_PRINT("tCgC layout", tCgC.layout());
+    CUTE_PRINT("tCrC layout", tCrC.layout());
+  }
 
   CUTE_STATIC_ASSERT_V(size<0>(tCrC) == size<0>(tCgC));  // THR_M
   CUTE_STATIC_ASSERT_V(size<0>(tCrC) == size<0>(tCsA));  // THR_M
@@ -189,7 +189,7 @@ int main() {
 
   dim3 block(16 * 16);
   dim3 grid(size(ceil_div(M, bM)), size(ceil_div(N, bN)));
-  gemm_f16_sliced_128x8_t16x16_kernel<<<grid, block>>>(
+  gemm_f16_tiled_128x8_t16x16_kernel<<<grid, block>>>(
       d_C.data().get(), d_A.data().get(), d_B.data().get(),  // data
       proble_shape, cta_tiler);
 
