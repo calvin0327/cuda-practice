@@ -1,0 +1,13 @@
+CompileFlags:
+  Remove:
+    - -forward-unknown-to-host-compiler
+    - --generate-code=arch=compute_70,code=[compute_70,sm_70]
+    - --generate-code=arch=compute_75,code=[compute_75,sm_75]
+    - --generate-code=arch=compute_80,code=[compute_80,sm_80]
+    - --generate-code=arch=compute_86,code=[compute_86,sm_86]
+    - --generate-code=arch=compute_89,code=[compute_89,sm_89]
+    - -Xcompiler=-fPIC
+  Add:
+    - -I/usr/include/c++/11
+    - -D__STDC_LIB_EXT1__=1
+    - -std=c++17

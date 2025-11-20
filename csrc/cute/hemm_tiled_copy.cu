@@ -1,5 +1,6 @@
-#include <stdlib.h>
 #include <cstdio>
+#include <stdlib.h>
+#include <cute/layout.hpp>
 #include <cuda.h>
 #include <cuda_runtime.h>
 
@@ -7,6 +8,7 @@
 #include <thrust/host_vector.h>
 #include <cute/tensor.hpp>
 #include <cute/util/print.hpp>
+#include <cute/tensor.hpp>
 
 #include "../utils.h"
 
@@ -79,8 +81,8 @@ __global__ void gemm_f16_tiled_copy_128x8_t16x16_kernel(T* C, T const* A,
 
   auto K_TILE_MAX = size<3>(tAgA);
   for (int k_tile = 0; k_tile < K_TILE_MAX; ++k_tile) {
-    copy(tAgA(_, _, _, k_tile), tAsA);
-    copy(tBgB(_, _, _, k_tile), tBsB);
+    copy(tiled_copy_a, tAgA(_, _, _, k_tile), tAsA);
+    copy(tiled_copy_b, tBgB(_, _, _, k_tile), tBsB);
     __syncthreads();  // Wait for all threads to write
 
     // Compute gemm on tC thread-partitioned smem

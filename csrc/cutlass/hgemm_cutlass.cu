@@ -1,7 +1,5 @@
 #include <cutlass/cutlass.h>
 #include <cutlass/gemm/device/gemm.h>
-#include <iostream>
-#include <vector>
 #include <cmath>
 
 #include "../utils.h"

@@ -12,10 +12,9 @@
 
 // Setup params for an NT HEMM
 template <class T, class ProblemShape, class CtaTiler>
-__global__ void gemm_f16_tiled_128x8_t16x16_kernel(T* C, T const* A,
-                                                    T const* B,
-                                                    ProblemShape shape_MNK,
-                                                    CtaTiler cta_tiler) {
+__global__ void gemm_f16_tiled_128x8_t16x16_kernel(T* C, T const* A, T const* B,
+                                                   ProblemShape shape_MNK,
+                                                   CtaTiler cta_tiler) {
   using namespace cute;
 
   CUTE_STATIC_ASSERT_V(rank(shape_MNK) == Int<3>{});

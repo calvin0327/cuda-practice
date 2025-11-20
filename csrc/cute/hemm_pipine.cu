@@ -97,8 +97,8 @@ __global__ void gemm_f16_stream_128x8_t16x16_kernel(T* C, T const* A,
 
     // Copy gmem to rmem for k_tile+1 with tA|tB thread-partitioned tensors
     int k_tile_next = (k_tile + 1 < K_TILE_MAX) ? k_tile + 1 : k_tile;
-    copy(copy_a, tAgA(_, _, _, k_tile_next), tArA);
-    copy(copy_b, tBgB(_, _, _, k_tile_next), tBrB);
+    copy(tiled_copy_a, tAgA(_, _, _, k_tile_next), tArA);
+    copy(tiled_copy_b, tBgB(_, _, _, k_tile_next), tBrB);
 
     __syncthreads();  // Wait for all threads to write
 
