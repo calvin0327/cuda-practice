@@ -1,92 +1,96 @@
-import time
-
-import torch
 import triton
+import torch
+import triton.testing
 import triton.language as tl
+import utils
 
+@triton.autotune(
+    configs = [
+        triton.Config({"BLOCK_SIZE": BLOCK_SIZE}) for BLOCK_SIZE in [32, 64]
+    ],
+    key = ["M", "N"],
+    use_cuda_graph=utils.use_cuda_graph,
+)
 @triton.jit
 def transpose_kernel(
     in_ptr: tl.tensor,
     out_ptr: tl.tensor,
     M: tl.int32,
     N: tl.int32,
-    TILE_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
 ):
-    by = tl.program_id(0)
-    bx = tl.program_id(1)
+    by = tl.program_id(0) # 1dim represents y
+    bx = tl.program_id(1) # 2dim represents x
 
-    by_offset = by * TILE_SIZE + tl.arange(0, TILE_SIZE)
-    bx_offset = bx * TILE_SIZE + tl.arange(0, TILE_SIZE)
+    # if by is 0, the by_offset is (0, 1, 2, 3 .... 32)
+    by_offset = by * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    bx_offset = bx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
 
+    # calculate the offset of each element in the tile, it is to a matrix
     block_offset = by_offset[:, None] * N + bx_offset[None, :]
     mask = (by_offset[:, None] < M) & (bx_offset[None, :] < N) 
 
     block = tl.load(in_ptr + block_offset, mask=mask)
     trans_block = tl.trans(block)
 
+    # calculate the offset of each element in the tile of b matrix
     trans_block_offset = bx_offset[:, None] * M + by_offset[None, :]
-    tl.store(out_ptr+ trans_block_offset, trans_block, mask=mask.T)
+    tl.store(out_ptr + trans_block_offset, trans_block, mask=mask.T)
 
 def triton_transpose(a: torch.Tensor) -> torch.Tensor:
     assert a.ndim == 2, f"only support 2D tensor transpose, current dim is {a.ndim}"
-
     m, n = a.shape
     dtype = a.dtype
     device = a.device
     
-    TILE_SIZE = 32
-    b = torch.empty((m,n), dtype=dtype, device=device)
+    b = torch.empty((n, m), dtype=dtype, device=device)
 
-    grid_size = (triton.cdiv(m, TILE_SIZE), triton.cdiv(n, TILE_SIZE))
-    transpose_kernel[grid_size](a, b, m, n, TILE_SIZE)
+    grid = lambda META: (triton.cdiv(m, META["BLOCK_SIZE"]), triton.cdiv(n, META["BLOCK_SIZE"]))
+    transpose_kernel[grid](a, b, m, n)
     return b
 
-def test_triton_transpose():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.float32
-    
-    if torch.cuda.is_available():
-        print("\n3. Performance Test (GPU Only)...")
-        perf_shapes = [
-            (1024, 1024),    # 1Kx1K
-            (4096, 4096),    # 4Kx4K
-            (8192, 8192),    # 8Kx8K
-            (16384, 8192),   # 16Kx8K
-            (16384, 16384),   # 16Kx8K
-        ]
-        warmup_runs = 5
-        test_runs = 100
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["size"],
+        x_vals=[256, 512, 1024, 2048, 4096, 8192],
+        x_log=True,
+        line_arg="impl",
+        line_vals=["triton", "pytorch"],
+        line_names=["Triton (Tile=32)", "PyTorch Native"],
+        ylabel="Latency",
+        plot_name="transpose-perf-benchmark",
+        args={"dtype": torch.float32},
+    )
+)
+def benchmark(size, impl, dtype):
+    device = torch.device("cuda")
+    a = torch.randn(size, size, dtype=dtype, device=device)
 
-        for (m, n) in perf_shapes:
-            a = torch.randn(m, n, dtype=dtype, device=device)
-            print(f"  Testing shape: {m}x{n}...")
+    if impl == "triton":
+        fn = lambda: triton_transpose(a)
+    elif impl == "pytorch":
+        fn = lambda: a.T.contiguous()
 
-            for _ in range(warmup_runs):
-                triton_transpose(a)
-                a.T.contiguous()
-            torch.cuda.synchronize()
+    mean_latency = triton.testing.do_bench(fn)
+    return mean_latency
 
-            start_time = time.time()
-            for _ in range(test_runs):
-                triton_out = triton_transpose(a)
-            torch.cuda.synchronize()
-            triton_avg_time = (time.time() - start_time) / test_runs
+def test_correctness():
+    test_shapes = [(32, 32), (33, 65), (1024, 2048), (1, 1000), (1000, 1)]
+    for m, n in test_shapes:
+        a = torch.randn(m, n, device="cuda")
+        triton_out = triton_transpose(a)
+        pytorch_out = a.T.contiguous()
 
-            start_time = time.time()
-            for _ in range(test_runs):
-                torch_out = a.T.contiguous()
-            torch.cuda.synchronize()
-            torch_avg_time = (time.time() - start_time) / test_runs
-
-            data_size = 2 * m * n * dtype.itemsize 
-            triton_bandwidth = data_size / (triton_avg_time * 1e9)  # GB/s
-            torch_bandwidth = data_size / (torch_avg_time * 1e9)
-
-            print(f"    Triton: {triton_avg_time:.4f} ms | Bandwidth: {triton_bandwidth:.2f} GB/s")
-            print(f"    PyTorch: {torch_avg_time:.4f} ms | Bandwidth: {torch_bandwidth:.2f} GB/s")
-            print(f"    Speedup: {torch_avg_time / triton_avg_time:.2f}x (Triton vs PyTorch)")
-
-    print("\n=== All Tests Completed ===")
+        triton.testing.assert_close(
+            triton_out, pytorch_out, rtol=1e-4,
+            err_msg=f"Shape {m}x{n} mismatch"
+        )
+        print(f"✓ Shape {m}x{n} passed")
+    print("Correctness test completed!\n")
 
 if __name__ == "__main__":
-    test_triton_transpose()
+    print("=== Testing Correctness ===")
+    test_correctness()
+
+    print("=== Running Performance Benchmark ===")
+    benchmark.run(print_data=True, save_path=None)

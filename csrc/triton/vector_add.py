@@ -33,16 +33,15 @@ def triton_vector_add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     n = a.shape[0]
     c = torch.empty_like(a)
     BLOCK_SIZE = 1024
-    grid_size = (triton.cdiv(n, BLOCK_SIZE),)
+    grid = (triton.cdiv(n, BLOCK_SIZE),)
 
     # Launch Triton kernel
-    vector_add_kernel[grid_size](
+    vector_add_kernel[grid](
         a_ptr=a,
         b_ptr=b,
         c_ptr=c,
         n=n,
         BLOCK_SIZE=BLOCK_SIZE,
-        num_warps=4
     )
     return c
 
