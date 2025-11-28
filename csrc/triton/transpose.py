@@ -2,6 +2,8 @@ import triton
 import torch
 import triton.testing
 import triton.language as tl
+from typing import Optional
+
 import utils
 
 @triton.autotune(
@@ -37,42 +39,54 @@ def transpose_kernel(
     trans_block_offset = bx_offset[:, None] * M + by_offset[None, :]
     tl.store(out_ptr + trans_block_offset, trans_block, mask=mask.T)
 
-def triton_transpose(a: torch.Tensor) -> torch.Tensor:
+def triton_transpose(
+    a: torch.Tensor,
+    stream: Optional[torch.cuda.Stream] = None
+) -> torch.Tensor:
     assert a.ndim == 2, f"only support 2D tensor transpose, current dim is {a.ndim}"
-    m, n = a.shape
-    dtype = a.dtype
-    device = a.device
-    
-    b = torch.empty((n, m), dtype=dtype, device=device)
+    if a.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        raise TypeError(f"Unsupported dtype {a.dtype}, only support float32/float16/bfloat16")
 
-    grid = lambda META: (triton.cdiv(m, META["BLOCK_SIZE"]), triton.cdiv(n, META["BLOCK_SIZE"]))
-    transpose_kernel[grid](a, b, m, n)
-    return b
+    a = a.contiguous()
+    M, N = a.shape
+    b = torch.empty((N, M), dtype=a.dtype, device=a.device)
+
+    grid = lambda META: (triton.cdiv(M, META["BLOCK_SIZE"]), triton.cdiv(N, META["BLOCK_SIZE"]))
+    with torch.cuda.stream(stream) if stream else torch.cuda.default_stream():
+        transpose_kernel[grid](a, b, M, N)
+
+    return b.contiguous()
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["size"],
-        x_vals=[256, 512, 1024, 2048, 4096, 8192],
+        x_vals=[256, 512, 1024, 2048, 4096, 8192, 16384],
         x_log=True,
         line_arg="impl",
         line_vals=["triton", "pytorch"],
-        line_names=["Triton (Tile=32)", "PyTorch Native"],
-        ylabel="Latency",
+        line_names=["Triton (Auto-Tune)", "PyTorch Native"],
+        ylabel="Latency (ms)",
         plot_name="transpose-perf-benchmark",
         args={"dtype": torch.float32},
+        xlabel="Matrix Size (NxN)"
     )
 )
 def benchmark(size, impl, dtype):
+    torch.manual_seed(42)
     device = torch.device("cuda")
     a = torch.randn(size, size, dtype=dtype, device=device)
 
     if impl == "triton":
-        fn = lambda: triton_transpose(a)
+        def fn():
+            return triton_transpose(a)
     elif impl == "pytorch":
-        fn = lambda: a.T.contiguous()
+        def fn():
+            return a.T.contiguous()
+    else:
+        raise ValueError(f"Unsupported impl: {impl}")
 
     mean_latency = triton.testing.do_bench(fn)
-    return mean_latency
+    return mean_latency * 1000
 
 def test_correctness():
     test_shapes = [(32, 32), (33, 65), (1024, 2048), (1, 1000), (1000, 1)]
@@ -93,4 +107,4 @@ if __name__ == "__main__":
     test_correctness()
 
     print("=== Running Performance Benchmark ===")
-    benchmark.run(print_data=True, save_path=None)
+    benchmark.run(print_data=True, save_path=None, show_plots=True)
