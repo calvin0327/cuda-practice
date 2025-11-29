@@ -20,15 +20,31 @@ def transpose_kernel(
     N: tl.int32,
     BLOCK_SIZE: tl.constexpr,
 ):
-    by = tl.program_id(0)  # 1dim represents y
-    bx = tl.program_id(1)  # 2dim represents x
+    by = tl.program_id(axis=0)  # 1dim represents y
+    bx = tl.program_id(axis=1)  # 2dim represents x
 
-    # if by is 0, the by_offset is (0, 1, 2, 3 .... 32)
+    # if by is 0, the by_offset is [0, 1, 2, 3 .... 31]
     by_offset = by * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     bx_offset = bx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
 
     # calculate the offset of each element in the tile, it is to a matrix
+    # BLOCK_SIZE is 32, N is 32, block_offset is:
+    # [[   0,    1,    2, ...,   29,   30,   31],
+    #  [  32,   33,   34, ...,   61,   62,   63],
+    #  [  64,   65,   66, ...,   93,   94,   95],
+    #  ...,
+    #  [ 928,  929,  930, ...,  957,  958,  959],
+    #  [ 960,  961,  962, ...,  989,  990,  991],
+    #  [ 992,  993,  994, ..., 1021, 1022, 1023]]
     block_offset = by_offset[:, None] * N + bx_offset[None, :]
+    # the mask is:
+    #  [[ True,  True,  True, ...,  True,  True,  True],
+    #   [ True,  True,  True, ...,  True,  True,  True],
+    #   [ True,  True,  True, ...,  True,  True,  True],
+    #   ...,
+    #   [ True,  True,  True, ...,  True,  True,  True],
+    #   [ True,  True,  True, ...,  True,  True,  True],
+    #   [ True,  True,  True, ...,  True,  True,  True]]
     mask = (by_offset[:, None] < M) & (bx_offset[None, :] < N)
 
     block = tl.load(in_ptr + block_offset, mask=mask)

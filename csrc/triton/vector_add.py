@@ -5,19 +5,29 @@ import triton
 import triton.language as tl
 
 
+@triton.autotune(
+    configs=[triton.Config({"BLOCK_SIZE": BLOCK_SIZE}) for BLOCK_SIZE in (32, 64, 128)],
+    key=["N"],
+)
 @triton.jit
 def vector_add_kernel(
     a_ptr: tl.tensor,
     b_ptr: tl.tensor,
     c_ptr: tl.tensor,
-    n: torch.int32,
+    N: torch.int32,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
 
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n
+    # BLOCK_SIZE is 32, the offsets is:
+    # [ 0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15, 16,
+    #   17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    # [ True,  True,  True,  True,  True,  True,  True,  True,  True,
+    #   True,  True,  True,  True,  True,  True,  True,  True,  True,
+    #   True,  True,  True,  True,  True,  True,  True,  True,  True,
+    #   True,  True,  True,  True,  True]
+    mask = offsets < N
 
     a = tl.load(a_ptr + offsets, mask=mask)
     b = tl.load(b_ptr + offsets, mask=mask)
@@ -35,16 +45,15 @@ def triton_vector_add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     # Configure block size and grid size
     n = a.shape[0]
     c = torch.empty_like(a)
-    BLOCK_SIZE = 1024
-    grid = (triton.cdiv(n, BLOCK_SIZE),)
+
+    grid = lambda META: (triton.cdiv(n, META["BLOCK_SIZE"]),)
 
     # Launch Triton kernel
     vector_add_kernel[grid](
         a_ptr=a,
         b_ptr=b,
         c_ptr=c,
-        n=n,
-        BLOCK_SIZE=BLOCK_SIZE,
+        N=n,
     )
     return c
 
