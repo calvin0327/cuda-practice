@@ -64,8 +64,8 @@ def matmul_kernel(
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
 
-    m_offset = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M) % M
-    n_offset = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N) % N
+    m_offset = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    n_offset = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     k_offset = tl.arange(0, BLOCK_SIZE_K)
 
     # the shape of a_ptrs is [BLOCK_SIZE_M, BLOCK_SIZE_K]
@@ -79,8 +79,8 @@ def matmul_kernel(
         # the shape of (mask=k_offset[:, None] < K - k * BLOCK_SIZE_K) is [BLOCK_SIZE_K, 1]
         # mask_a: [[ True,  True,  True,  True,  True,  True,  True,  True,  True, .... True ]]
         # mask_b: [[True], [True], [True], [True], [True], [True],[True], [True] .... [True]]
-        mask_a = k_offset[None, :] < K - k * BLOCK_SIZE_K
-        mask_b = k_offset[:, None] < K - k * BLOCK_SIZE_K
+        mask_a = (m_offset[:, None] < M) & k_offset[None, :] < K - k * BLOCK_SIZE_K
+        mask_b = (n_offset[None, :] < N) & k_offset[:, None] < K - k * BLOCK_SIZE_K
         a = tl.load(a_ptrs, mask=mask_a, other=0.0)
         b = tl.load(b_ptrs, mask=mask_b, other=0.0)
 
