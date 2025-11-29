@@ -11,10 +11,10 @@ import triton.language as tl
 )
 @triton.jit
 def vector_add_kernel(
-    a_ptr: tl.tensor,
-    b_ptr: tl.tensor,
-    c_ptr: tl.tensor,
-    N: torch.int32,
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    N,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)

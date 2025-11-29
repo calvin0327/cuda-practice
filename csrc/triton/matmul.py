@@ -45,18 +45,18 @@ def get_triton_configs():
 @triton.autotune(configs=get_triton_configs(), key=["M", "N", "K"])
 @triton.jit
 def matmul_kernel(
-    a_ptr: tl.tensor,
-    b_ptr: tl.tensor,
-    c_ptr: tl.tensor,
-    M: tl.int32,
-    N: tl.int32,
-    K: tl.int32,
-    stride_am: tl.int32,
-    stride_ak: tl.int32,
-    stride_bk: tl.int32,
-    stride_bn: tl.int32,
-    stride_cm: tl.int32,
-    stride_cn: tl.int32,
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -132,7 +132,7 @@ def matmul(
     return c
 
 
-def test_correctness():
+def test():
     torch.manual_seed(0)
     a = torch.randn((512, 512), device="cuda", dtype=torch.bfloat16)
     b = torch.randn((512, 512), device="cuda", dtype=torch.bfloat16)
@@ -209,5 +209,5 @@ def benchmark(M, N, K, provider, fp8_inputs):
 
 
 if __name__ == "__main__":
-    test_correctness()
-    benchmark.run(show_plots=True, print_data=True)
+    test()
+    benchmark.run(show_plots=True, save_path=".", print_data=True)
