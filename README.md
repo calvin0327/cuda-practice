@@ -14,3 +14,10 @@ mkdir build & cd build
 cmake ..
 make
 ```
+
+# debug triton kernel
+
+```bash
+.venv/bin/activate
+TRITON_INTERPRET=1 python -m pdb csrc/triton/matmul.py
+```
