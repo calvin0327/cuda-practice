@@ -1,3 +1,4 @@
+import math
 import torch
 import triton
 import triton.language as tl
@@ -32,12 +33,10 @@ def flash_attn_kernel_v1(
     HEAD_DIM: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
 ):
-    # 定义三个维度的作用
     b_id = tl.program_id(0)
     h_id = tl.program_id(1)
     q_id = tl.program_id(2)
 
-    # q 和 o 的地址定位
     q_offsets = q_id * BLOCK_M + tl.arange(0, BLOCK_M)
     q_mask = q_offsets < N_CTX
 
@@ -48,6 +47,8 @@ def flash_attn_kernel_v1(
         + q_offsets[:, None] * stride_qm
         + tl.arange(0, HEAD_DIM)[None, :] * stride_qk
     )
+    q = tl.load(q_ptrs, mask=q_mask[:, None], other=0)
+
     o_ptrs = (
         O_ptr
         + b_id * stride_ob
@@ -56,64 +57,61 @@ def flash_attn_kernel_v1(
         + tl.arange(0, HEAD_DIM)[None, :] * stride_ok
     )
 
-    # 加载 q to sram
-    q = tl.load(q_ptrs, mask=q_mask[:, None], other=0)
-
-    # 定义全局变量 max，l
-    m_i = tl.full([BLOCK_M], float("inf"), dtype=tl.float32)
+    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     o_i = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
-    # 计算 kv 循环次数
-    j = tl.cdiv(N_CTX, BLOCK_N)
+    num_kv_blocks = tl.cdiv(N_CTX, BLOCK_N)
 
-    for j in range(j):
-        k_offsets = j * BLOCK_N + tl.arange(0, BLOCK_N)
-        mask = k_offsets < N_CTX
+    for j in range(0, num_kv_blocks):
+        kv_offsets = j * BLOCK_N + tl.arange(0, BLOCK_N)
+        kv_mask = kv_offsets < N_CTX
 
         k_ptrs = (
             K_ptr
             + b_id * stride_kb
             + h_id * stride_kh
-            + k_offsets[:, None] * stride_kn
-            + tl.range(0, HEAD_DIM)[None, :] * stride_kk
+            + kv_offsets[:, None] * stride_kn
+            + tl.arange(0, HEAD_DIM)[None, :] * stride_kk
         )
+        k = tl.load(k_ptrs, mask=kv_mask[:, None], other=0.0)
+
         v_ptrs = (
             V_ptr
             + b_id * stride_vb
             + h_id * stride_vh
-            + k_offsets[:, None] * stride_vn
-            + tl.range(0, HEAD_DIM)[None, :] * stride_vk
+            + kv_offsets[:, None] * stride_vn
+            + tl.arange(0, HEAD_DIM)[None, :] * stride_vk
         )
-        k = tl.load(k_ptrs, mask=mask[:, None], other=0.0)
-        v = tl.load(v_ptrs, mask=mask[:, None], other=0.0)
+        v = tl.load(v_ptrs, mask=kv_mask[:, None], other=0.0)
 
         # shape: [BLOCK_M, BLOCK_N]
         s = tl.dot(q, tl.trans(k)) * sm_scale
 
-        # 计算当前最大值
+        # Apply masks
+        valid_mask = q_mask[:, None] & kv_mask[None, :]
+
+        if IS_CAUSAL:
+            causal_mask = q_offsets[:, None] >= kv_offsets[None, :]
+            valid_mask = valid_mask & causal_mask
+
+        s = tl.where(valid_mask, s, float("-inf"))
+
         m_new = tl.maximum(m_i, tl.max(s, axis=1))
 
-        # 计算差值
         alpha = tl.exp(m_i - m_new)
 
-        # 计算分母
-        l_new = l_i * alpha + tl.sum(tl.exp(s - m_new[:, None]), axis=1)
-
-        # 计算分子
-        p = tl.exp(s - m_new)
+        p = tl.exp(s - m_new[:, None])
+        l_new = l_i * alpha + tl.sum(p, axis=1)
         pv = tl.dot(p.to(v.dtype), v)
 
-        # 累积
         o_i = alpha[:, None] * o_i + pv
 
+        # update the max and l
         l_i = l_new
         m_i = m_new
 
-    # 归一化
     o_i = o_i / l_i[:, None]
-
-    # store o to HBM
     tl.store(o_ptrs, o_i.to(O_ptr.dtype.element_ty), mask=q_mask[:, None])
 
 
@@ -121,20 +119,24 @@ def flash_attn_v1(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    causal: bool = True,
 ) -> torch.Tensor:
+    assert q.dim() == 4, f"Expected 4D tensor, got {q.dim()}D"
+    assert q.shape == k.shape == v.shape, "Q, K, V shapes must match"
+    assert q.dtype in [torch.float16, torch.bfloat16, torch.float32]
+    assert q.is_cuda, "Input must be on CUDA"
 
-    b, h, n, d = q.shape
-    assert q.dtype == k.dtype == v.dtype
+    B, H, N, D = q.shape
 
-    scale = 1.0 / tl.sqrt(d)
+    scale = 1.0 / math.sqrt(D)
 
     o = torch.empty_like(q)
 
     BLOCK_SIZE_M = 64
     BLOCK_SIZE_N = 64
 
-    num_q_blocks = triton.cdiv(n, BLOCK_SIZE_M)
-    grid = (b, h, num_q_blocks)
+    num_q_blocks = triton.cdiv(N, BLOCK_SIZE_M)
+    grid = (B, H, num_q_blocks)
     flash_attn_kernel_v1[grid](
         q,
         k,
@@ -157,9 +159,81 @@ def flash_attn_v1(
         o.stride(2),
         o.stride(3),
         sm_scale=scale,
-        N_CTX=n,
-        HEAD_DIM=d,
+        N_CTX=N,
+        HEAD_DIM=D,
         BLOCK_M=BLOCK_SIZE_M,
         BLOCK_N=BLOCK_SIZE_N,
+        IS_CAUSAL=causal,
     )
+
     return o
+
+
+def attention_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    causal: bool = True,
+) -> torch.Tensor:
+    scale = 1.0 / math.sqrt(q.size(-1))
+    s = torch.matmul(q, torch.transpose(k, -2, -1)) * scale
+
+    if causal:
+        N = q.size(-2)
+        mask = torch.triu(
+            torch.ones(N, N, device=q.device, dtype=torch.bool), diagonal=1
+        )
+        s.masked_fill_(mask, float("-inf"))
+
+    p = torch.softmax(s, dim=-1)
+    o = torch.matmul(p, v)
+    return o
+
+
+def test():
+    print("-" * 60)
+    print("FlashAttention Test")
+    print("-" * 60)
+
+    torch.manual_seed(42)
+
+    test_configs = [
+        # (B, H, N, D, causal)
+        (1, 1, 64, 64, False),
+        (1, 1, 128, 64, False),
+        (2, 4, 256, 64, False),
+        (2, 8, 512, 64, False),
+        (1, 4, 1024, 64, False),
+        (2, 8, 2048, 128, False),
+        # Causal
+        (1, 1, 64, 64, True),
+        (2, 4, 256, 64, True),
+        (2, 8, 512, 64, True),
+        (1, 4, 1024, 128, True),
+    ]
+
+    for B, H, N, D, causal in test_configs:
+        q = torch.randn((B, H, N, D), device="cuda", dtype=torch.float16)
+        k = torch.randn((B, H, N, D), device="cuda", dtype=torch.float16)
+        v = torch.randn((B, H, N, D), device="cuda", dtype=torch.float16)
+
+        ref_o = attention_reference(q, k, v, causal)
+        ref_o = ref_o.half()
+
+        triton_o = flash_attn_v1(q, k, v, causal)
+
+        max_diff = (ref_o - triton_o).abs().max().item()
+        mean_diff = (ref_o - triton_o).abs().mean().item()
+
+        status = "✓" if max_diff < 0.01 else "✗"
+        causal_str = "causal" if causal else "full"
+
+        print(
+            f"{status} B={B}, H={H}, N={N:4d}, D={D:3d}, {causal_str:6s} | "
+            f"max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}"
+        )
+    print("\ntest completed!")
+
+
+if __name__ == "__main__":
+    test()
