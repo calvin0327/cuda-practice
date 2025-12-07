@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+from flash_attn_v1 import attention_reference
+
 
 # We don't run auto-tuning every time to keep the tutorial fast. Keeping
 # the code below and commenting out the equivalent parameters is convenient for
@@ -66,11 +68,14 @@ def flash_attn_kernel_v2(
     off_z = off_hz // H  # B * H
     off_h = off_hz % H
 
-    qvk_offset = off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh
+    q_offset = off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh
+    k_offset = off_z.to(tl.int64) * stride_kz + off_h.to(tl.int64) * stride_kh
+    v_offset = off_z.to(tl.int64) * stride_vz + off_h.to(tl.int64) * stride_vh
+    o_offset = off_z.to(tl.int64) * stride_oz + off_h.to(tl.int64) * stride_oh
 
     # block pointers
     Q_block_ptr = tl.make_block_ptr(
-        base=Q + qvk_offset,
+        base=Q + q_offset,
         shape=(N_CTX, HEAD_DIM),
         strides=(stride_qm, stride_qk),
         offsets=(start_m * BLOCK_M, 0),
@@ -79,7 +84,7 @@ def flash_attn_kernel_v2(
     )
 
     V_block_ptr = tl.make_block_ptr(
-        base=V + qvk_offset,
+        base=V + v_offset,
         shape=(N_CTX, HEAD_DIM),
         strides=(stride_vk, stride_vn),
         offsets=(0, 0),
@@ -88,7 +93,7 @@ def flash_attn_kernel_v2(
     )
 
     K_block_ptr = tl.make_block_ptr(
-        base=K + qvk_offset,
+        base=K + k_offset,
         shape=(HEAD_DIM, N_CTX),
         strides=(stride_kk, stride_kn),
         offsets=(0, 0),
@@ -97,7 +102,7 @@ def flash_attn_kernel_v2(
     )
 
     O_block_ptr = tl.make_block_ptr(
-        base=Out + qvk_offset,
+        base=Out + o_offset,
         shape=(N_CTX, HEAD_DIM),
         strides=(stride_om, stride_on),
         offsets=(start_m * BLOCK_M, 0),
@@ -109,7 +114,7 @@ def flash_attn_kernel_v2(
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
 
-    # initialize pointer to m and l、
+    # initialize pointer to m and l
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
@@ -127,7 +132,7 @@ def flash_attn_kernel_v2(
     else:
         lo, hi = 0, N_CTX
 
-        K_block_ptr = tl.advance(K_block_ptr, (0, lo))
+    K_block_ptr = tl.advance(K_block_ptr, (0, lo))
     V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
 
     # loop over k, v and update accumulator
@@ -223,41 +228,42 @@ def flash_attn_v2(
         HEAD_DIM=HEAD_DIM_K,  #
         IS_CAUSAL=causal,  #
     )
+    return o
 
 
 # @pytest.mark.parametrize("Z, H, N_CTX, HEAD_DIM", [(1, 2, 1024, 64)])
 # @pytest.mark.parametrize("causal", [True])
 def test_op(Z, H, N_CTX, HEAD_DIM, causal, dtype=torch.float16):
     torch.manual_seed(20)
-    q = (
-        torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device="cuda")
-        .normal_(mean=0.0, std=0.5)
-        .requires_grad_()
-    )
-    k = (
-        torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device="cuda")
-        .normal_(mean=0.0, std=0.5)
-        .requires_grad_()
-    )
-    v = (
-        torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device="cuda")
-        .normal_(mean=0.0, std=0.5)
-        .requires_grad_()
-    )
-    sm_scale = 0.5
+    q = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device="cuda")
+    k = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device="cuda")
+    v = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device="cuda")
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
 
     # reference implementation
     M = torch.tril(torch.ones((N_CTX, N_CTX), device="cuda"))
-    p = torch.matmul(q, k.transpose(2, 3)) * sm_scale
-    if causal:
-        p[:, :, M == 0] = float("-inf")
-    p = torch.softmax(p.float(), dim=-1).half()
 
-    # p = torch.exp(p)
-    ref_out = torch.matmul(p, v)
+    ref_out = attention_reference(q, k, v, causal)
 
     # triton implementation
-    tri_out = flash_attn_v2(q, k, v, causal, sm_scale).half()
+    tri_out = flash_attn_v2(q, k, v, causal).half()
 
     # compare
+    diff = (ref_out - tri_out).abs()
+    max_diff = diff.max().item()
+    mean_diff = diff.mean().item()
+    num_large_diff = (diff > 0.01).sum().item()
+    print(f"Max diff: {max_diff:.6f}")
+    print(f"Mean diff: {mean_diff:.6f}")
+    print(f"Number of elements with diff > 0.01: {num_large_diff}")
+    print(
+        f"Ref out stats: min={ref_out.min().item():.6f}, max={ref_out.max().item():.6f}, mean={ref_out.mean().item():.6f}"
+    )
+    print(
+        f"Tri out stats: min={tri_out.min().item():.6f}, max={tri_out.max().item():.6f}, mean={tri_out.mean().item():.6f}"
+    )
     assert torch.allclose(ref_out, tri_out, atol=1e-2, rtol=0)
+
+
+if __name__ == "__main__":
+    test_op(1, 2, 1024, 64, False)

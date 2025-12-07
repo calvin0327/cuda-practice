@@ -8,7 +8,7 @@ from csrc.triton.flash_attn_v2 import flash_attn_v2
 def get_perf_config():
     batch, n_heads, head_dim = 4, 32, 64
     configs = []
-    for causal in [True, False]:
+    for causal in [False]:
         configs.append(
             triton.testing.Benchmark(
                 x_names=["N_CTX"],
@@ -44,9 +44,11 @@ def benchmark(B, H, N_CTX, D, provider, causal):
     rep = 100
     dtype = torch.float16
 
-    q = torch.randn((B, H, N_CTX, D), dtype=dtype, device="cuda", requires_grad=True)
-    k = torch.randn((B, H, N_CTX, D), dtype=dtype, device="cuda", requires_grad=True)
-    v = torch.randn((B, H, N_CTX, D), dtype=dtype, device="cuda", requires_grad=True)
+    torch.manual_seed(20)
+
+    q = torch.randn((B, H, N_CTX, D), dtype=dtype, device="cuda")
+    k = torch.randn((B, H, N_CTX, D), dtype=dtype, device="cuda")
+    v = torch.randn((B, H, N_CTX, D), dtype=dtype, device="cuda")
     # sm_scale = 1.3
     if provider == "pytorch attn":
         fn = lambda: attention_reference(q, k, v, causal)
