@@ -4,7 +4,10 @@ import torch
 import triton
 import triton.language as tl
 
-from flash_attn_v1 import attention_reference
+try:
+    from csrc.triton.flash_attn_v1 import attention_reference
+except ImportError:
+    from flash_attn_v1 import attention_reference
 
 
 # We don't run auto-tuning every time to keep the tutorial fast. Keeping
@@ -238,21 +241,15 @@ def test_op(Z, H, N_CTX, HEAD_DIM, causal, dtype=torch.float16):
     q = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device="cuda")
     k = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device="cuda")
     v = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device="cuda")
-    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
-
-    # reference implementation
-    M = torch.tril(torch.ones((N_CTX, N_CTX), device="cuda"))
 
     ref_out = attention_reference(q, k, v, causal)
-
-    # triton implementation
     tri_out = flash_attn_v2(q, k, v, causal).half()
 
-    # compare
     diff = (ref_out - tri_out).abs()
     max_diff = diff.max().item()
     mean_diff = diff.mean().item()
     num_large_diff = (diff > 0.01).sum().item()
+
     print(f"Max diff: {max_diff:.6f}")
     print(f"Mean diff: {mean_diff:.6f}")
     print(f"Number of elements with diff > 0.01: {num_large_diff}")

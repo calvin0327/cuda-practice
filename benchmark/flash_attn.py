@@ -12,7 +12,7 @@ def get_perf_config():
         configs.append(
             triton.testing.Benchmark(
                 x_names=["N_CTX"],
-                x_vals=[2**i for i in range(2, 10)],
+                x_vals=[2**i for i in range(2, 3)],
                 line_arg="provider",
                 line_vals=[
                     "pytorch attn",
@@ -24,7 +24,7 @@ def get_perf_config():
                     "Triton flash-attn-v1 [FP16]",
                     "Triton flash-attn-v2 [FP16]",
                 ],
-                styles=[("red", "-"), ("blue", "-", "green", "-")],
+                styles=[("red", "-"), ("blue", "-"), ("green", "-")],
                 ylabel="ms",
                 plot_name=f"flash-attention-batch{batch}-head{n_heads}-d{head_dim}-causal={causal}",
                 args={
@@ -49,7 +49,7 @@ def benchmark(B, H, N_CTX, D, provider, causal):
     q = torch.randn((B, H, N_CTX, D), dtype=dtype, device="cuda")
     k = torch.randn((B, H, N_CTX, D), dtype=dtype, device="cuda")
     v = torch.randn((B, H, N_CTX, D), dtype=dtype, device="cuda")
-    # sm_scale = 1.3
+
     if provider == "pytorch attn":
         fn = lambda: attention_reference(q, k, v, causal)
     elif provider == "triton flash-attn-v1":
