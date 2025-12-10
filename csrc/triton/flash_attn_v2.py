@@ -33,29 +33,28 @@ def keep(conf):
 @triton.autotune(list(filter(keep, configs)), key=["N_CTX", "HEAD_DIM"])
 @triton.jit
 def flash_attn_kernel_v2(
-    Q,
-    K,
-    V,
+    Q_ptr,
+    K_ptr,
+    V_ptr,
     sm_scale,
-    M,
-    Out,
-    stride_qz,
+    O_ptr,
+    stride_qb,
     stride_qh,
     stride_qm,
     stride_qk,
-    stride_kz,
+    stride_kb,
     stride_kh,
     stride_kn,
     stride_kk,
-    stride_vz,
+    stride_vb,
     stride_vh,
     stride_vk,
     stride_vn,
-    stride_oz,
+    stride_ob,
     stride_oh,
     stride_om,
     stride_on,
-    Z,  # Batch size
+    B,  # Batch size
     H,  # Head size
     N_CTX,  # N size
     HEAD_DIM: tl.constexpr,
@@ -65,20 +64,20 @@ def flash_attn_kernel_v2(
 ):
     tl.static_assert(BLOCK_N <= HEAD_DIM)
 
-    start_m = tl.program_id(0)
-    off_hz = tl.program_id(1)
+    start_m = tl.program_id(0)  # 1 / tl.div(N_CTX, BLOCK_M)
+    off_hz = tl.program_id(1)  # 1 / batch_size * head_size tiles
 
-    off_z = off_hz // H  # B * H
+    # programs is B * H
+    off_z = off_hz // H
     off_h = off_hz % H
 
-    q_offset = off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh
-    k_offset = off_z.to(tl.int64) * stride_kz + off_h.to(tl.int64) * stride_kh
-    v_offset = off_z.to(tl.int64) * stride_vz + off_h.to(tl.int64) * stride_vh
-    o_offset = off_z.to(tl.int64) * stride_oz + off_h.to(tl.int64) * stride_oh
+    q_offset = off_z.to(tl.int64) * stride_qb + off_h.to(tl.int64) * stride_qh
+    k_offset = off_z.to(tl.int64) * stride_kb + off_h.to(tl.int64) * stride_kh
+    v_offset = off_z.to(tl.int64) * stride_vb + off_h.to(tl.int64) * stride_vh
+    o_offset = off_z.to(tl.int64) * stride_ob + off_h.to(tl.int64) * stride_oh
 
-    # block pointers
     Q_block_ptr = tl.make_block_ptr(
-        base=Q + q_offset,
+        base=Q_ptr + q_offset,
         shape=(N_CTX, HEAD_DIM),
         strides=(stride_qm, stride_qk),
         offsets=(start_m * BLOCK_M, 0),
@@ -86,17 +85,14 @@ def flash_attn_kernel_v2(
         order=(1, 0),
     )
 
-    V_block_ptr = tl.make_block_ptr(
-        base=V + v_offset,
-        shape=(N_CTX, HEAD_DIM),
-        strides=(stride_vk, stride_vn),
-        offsets=(0, 0),
-        block_shape=(BLOCK_N, HEAD_DIM),
-        order=(1, 0),
-    )
-
+    # K_block_ptr: 指向 K 矩阵。关键点：这里故意将 K 声明为转置形状 (D, N)。
+    # 这样加载进 SRAM 的数据块天然就是转置好的，做 dot(Q, K) 时不需要再 tl.trans。
+    # Note: K tensor has shape (N_CTX, HEAD_DIM) in last two dims, but we view it as (HEAD_DIM, N_CTX)
+    # strides: (stride_kk, stride_kn) = (1, HEAD_DIM) means:
+    #   - dimension 0 (HEAD_DIM): stride 1 (innermost, consecutive elements)
+    #   - dimension 1 (N_CTX): stride HEAD_DIM (next row)
     K_block_ptr = tl.make_block_ptr(
-        base=K + k_offset,
+        base=K_ptr + k_offset,
         shape=(HEAD_DIM, N_CTX),
         strides=(stride_kk, stride_kn),
         offsets=(0, 0),
@@ -104,8 +100,17 @@ def flash_attn_kernel_v2(
         order=(0, 1),
     )
 
+    V_block_ptr = tl.make_block_ptr(
+        base=V_ptr + v_offset,
+        shape=(N_CTX, HEAD_DIM),
+        strides=(stride_vn, stride_vk),
+        offsets=(0, 0),
+        block_shape=(BLOCK_N, HEAD_DIM),
+        order=(1, 0),
+    )
+
     O_block_ptr = tl.make_block_ptr(
-        base=Out + o_offset,
+        base=O_ptr + o_offset,
         shape=(N_CTX, HEAD_DIM),
         strides=(stride_om, stride_on),
         offsets=(start_m * BLOCK_M, 0),
@@ -113,37 +118,62 @@ def flash_attn_kernel_v2(
         order=(1, 0),
     )
 
-    # initialize offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
 
-    # initialize pointer to m and l
+    # initialize max, l and acc
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
-    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)  # result
 
     # load scales
     qk_scale = sm_scale
     qk_scale *= 1.44269504  # 1/log(2)
 
-    # load q: it will stay in SRAM throughout
     q = tl.load(Q_block_ptr)
 
-    # range of values handled by this stage
     if IS_CAUSAL:
-        lo, hi = 0, start_m * BLOCK_M
+        # Causal Attention (IS_CAUSAL=True):
+        # Q[i] Only for K[0:i]
+        #      K[0]  K[1]  K[2]  K[3]  K[4]
+        # Q[0]  ✗     ✗     ✗     ✗     ✗    ← hi = 0
+        # Q[1]  ✓     ✗     ✗     ✗     ✗    ← hi = BLOCK_M
+        # Q[2]  ✓     ✓     ✗     ✗     ✗    ← hi = 2*BLOCK_M
+        # Q[3]  ✓     ✓     ✓     ✗     ✗    ← hi = 3*BLOCK_M
+        # Q[4]  ✓     ✓     ✓     ✓     ✗    ← hi = 4*BLOCK_M
+        # lo, hi = 0, start_m * BLOCK_M
+        lo, hi = 0, (start_m + 1) * BLOCK_M
     else:
+        # Full Attention (IS_CAUSAL=False):
+        # 每个 Q 块都遍历所有 KV 块
+        #      K[0]  K[1]  K[2]  K[3]  K[4]
+        # Q[0]  ✓     ✓     ✓     ✓     ✓
+        # Q[1]  ✓     ✓     ✓     ✓     ✓
+        # Q[2]  ✓     ✓     ✓     ✓     ✓
+        # Q[3]  ✓     ✓     ✓     ✓     ✓
+        # Q[4]  ✓     ✓     ✓     ✓     ✓
         lo, hi = 0, N_CTX
 
     K_block_ptr = tl.advance(K_block_ptr, (0, lo))
     V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
 
-    # loop over k, v and update accumulator
     for start_n in range(lo, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
+
         # -- compute qk ----
         k = tl.load(K_block_ptr)
         qk = tl.dot(q, k)
+
+        if IS_CAUSAL:
+            # 如果当前是最后一个块（对角线块），应用 Mask
+            # 注意：如果 BLOCK_N != BLOCK_M，这里的逻辑需要更通用，
+            # 但通常 FlashAttn 假设 BLOCK_N <= BLOCK_M 且对齐
+            if start_n >= start_m * BLOCK_M:
+                # 只有 start_n + offs_n <= start_m + offs_m 的位置有效
+                # 即 col <= row
+                _offs_n = start_n + offs_n
+                mask = offs_m[:, None] >= _offs_n[None, :]
+                qk = tl.where(mask, qk, float("-inf"))
 
         m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
         qk = qk * qk_scale - m_ij[:, None]
@@ -169,11 +199,8 @@ def flash_attn_kernel_v2(
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
 
     # epilogue
-    m_i += tl.math.log2(l_i)
     acc = acc / l_i[:, None]
-    m_ptrs = M + off_hz * N_CTX + offs_m
-    tl.store(m_ptrs, m_i)
-    tl.store(O_block_ptr, acc.to(Out.type.element_ty))
+    tl.store(O_block_ptr, acc.to(O_ptr.type.element_ty))
 
 
 def flash_attn_v2(
@@ -207,29 +234,28 @@ def flash_attn_v2(
         k,
         v,
         sm_scale,
-        M,
-        o,  #
+        o,
         q.stride(0),
         q.stride(1),
         q.stride(2),
-        q.stride(3),  #
+        q.stride(3),
         k.stride(0),
         k.stride(1),
         k.stride(2),
-        k.stride(3),  #
+        k.stride(3),
         v.stride(0),
         v.stride(1),
         v.stride(2),
-        v.stride(3),  #
+        v.stride(3),
         o.stride(0),
         o.stride(1),
         o.stride(2),
-        o.stride(3),  #
-        q.shape[0],
-        q.shape[1],  #
-        N_CTX=q.shape[2],  #
-        HEAD_DIM=HEAD_DIM_K,  #
-        IS_CAUSAL=causal,  #
+        o.stride(3),
+        B=q.shape[0],
+        H=q.shape[1],
+        N_CTX=q.shape[2],
+        HEAD_DIM=HEAD_DIM_K,
+        IS_CAUSAL=causal,
     )
     return o
 

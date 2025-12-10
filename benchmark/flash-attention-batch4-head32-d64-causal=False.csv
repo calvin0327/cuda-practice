@@ -1,2 +1,1 @@
 N_CTX,Pytorch attn [FP16],Triton flash-attn-v1 [FP16],Triton flash-attn-v2 [FP16]
-4.000000,0.037869,0.069383,0.081786
