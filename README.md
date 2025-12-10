@@ -24,7 +24,7 @@ The benchmark results will be saved to `./benchmark/` directory, including:
 
 **Performance Results (TFLOPS):**
 
-![Flash Attention Performance](benchmark/flash-attention-performance.png)
+![Flash Attention Performance](benchmark/artfacts/flash-attention-batch4-head32-d64-causal=False.png)
 
 *Benchmark tested on A10 GPU*
 

@@ -85,12 +85,6 @@ def flash_attn_kernel_v2(
         order=(1, 0),
     )
 
-    # K_block_ptr: 指向 K 矩阵。关键点：这里故意将 K 声明为转置形状 (D, N)。
-    # 这样加载进 SRAM 的数据块天然就是转置好的，做 dot(Q, K) 时不需要再 tl.trans。
-    # Note: K tensor has shape (N_CTX, HEAD_DIM) in last two dims, but we view it as (HEAD_DIM, N_CTX)
-    # strides: (stride_kk, stride_kn) = (1, HEAD_DIM) means:
-    #   - dimension 0 (HEAD_DIM): stride 1 (innermost, consecutive elements)
-    #   - dimension 1 (N_CTX): stride HEAD_DIM (next row)
     K_block_ptr = tl.make_block_ptr(
         base=K_ptr + k_offset,
         shape=(HEAD_DIM, N_CTX),
@@ -103,7 +97,7 @@ def flash_attn_kernel_v2(
     V_block_ptr = tl.make_block_ptr(
         base=V_ptr + v_offset,
         shape=(N_CTX, HEAD_DIM),
-        strides=(stride_vn, stride_vk),
+        strides=(stride_vk, stride_vn),
         offsets=(0, 0),
         block_shape=(BLOCK_N, HEAD_DIM),
         order=(1, 0),
@@ -130,7 +124,7 @@ def flash_attn_kernel_v2(
     qk_scale = sm_scale
     qk_scale *= 1.44269504  # 1/log(2)
 
-    q = tl.load(Q_block_ptr)
+    q = tl.load(Q_block_ptr, boundary_check=(0, 1))
 
     if IS_CAUSAL:
         # Causal Attention (IS_CAUSAL=True):
@@ -142,10 +136,10 @@ def flash_attn_kernel_v2(
         # Q[3]  ✓     ✓     ✓     ✗     ✗    ← hi = 3*BLOCK_M
         # Q[4]  ✓     ✓     ✓     ✓     ✗    ← hi = 4*BLOCK_M
         # lo, hi = 0, start_m * BLOCK_M
-        lo, hi = 0, (start_m + 1) * BLOCK_M
+        lo = 0
+        hi = tl.minimum((start_m + 1) * BLOCK_M, N_CTX)
     else:
         # Full Attention (IS_CAUSAL=False):
-        # 每个 Q 块都遍历所有 KV 块
         #      K[0]  K[1]  K[2]  K[3]  K[4]
         # Q[0]  ✓     ✓     ✓     ✓     ✓
         # Q[1]  ✓     ✓     ✓     ✓     ✓
@@ -161,16 +155,11 @@ def flash_attn_kernel_v2(
         start_n = tl.multiple_of(start_n, BLOCK_N)
 
         # -- compute qk ----
-        k = tl.load(K_block_ptr)
+        k = tl.load(K_block_ptr, boundary_check=(0, 1))
         qk = tl.dot(q, k)
 
         if IS_CAUSAL:
-            # 如果当前是最后一个块（对角线块），应用 Mask
-            # 注意：如果 BLOCK_N != BLOCK_M，这里的逻辑需要更通用，
-            # 但通常 FlashAttn 假设 BLOCK_N <= BLOCK_M 且对齐
             if start_n >= start_m * BLOCK_M:
-                # 只有 start_n + offs_n <= start_m + offs_m 的位置有效
-                # 即 col <= row
                 _offs_n = start_n + offs_n
                 mask = offs_m[:, None] >= _offs_n[None, :]
                 qk = tl.where(mask, qk, float("-inf"))
@@ -189,7 +178,7 @@ def flash_attn_kernel_v2(
         acc = acc * alpha[:, None]
 
         # update acc
-        v = tl.load(V_block_ptr)
+        v = tl.load(V_block_ptr, boundary_check=(0, 1))
         p = p.to(tl.float16)
         acc = tl.dot(p, v, acc)
 
@@ -199,8 +188,9 @@ def flash_attn_kernel_v2(
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
 
     # epilogue
+    l_i = tl.where(l_i == 0, 1.0, l_i)
     acc = acc / l_i[:, None]
-    tl.store(O_block_ptr, acc.to(O_ptr.type.element_ty))
+    tl.store(O_block_ptr, acc.to(O_ptr.type.element_ty), boundary_check=(0, 1))
 
 
 def flash_attn_v2(
@@ -221,10 +211,6 @@ def flash_attn_v2(
         triton.cdiv(q.shape[2], args["BLOCK_M"]),  # N / BLOCKM
         q.shape[0] * q.shape[1],  # B * H
         1,
-    )
-
-    M = torch.empty(
-        (q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32
     )
 
     sm_scale = 1.0 / math.sqrt(q.shape[-1])
@@ -289,4 +275,4 @@ def test_op(Z, H, N_CTX, HEAD_DIM, causal, dtype=torch.float16):
 
 
 if __name__ == "__main__":
-    test_op(1, 2, 1024, 64, False)
+    test_op(1, 2, 1024, 64, True)
