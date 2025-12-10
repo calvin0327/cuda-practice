@@ -74,4 +74,4 @@ def benchmark(B, H, N_CTX, D, provider, causal):
 
 
 if __name__ == "__main__":
-    benchmark.run(show_plots=True, print_data=True, save_path="./benchmark/artfacts")
+    benchmark.run(show_plots=True, print_data=True, save_path="./benchmark/artifacts")

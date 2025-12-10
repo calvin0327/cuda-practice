@@ -135,7 +135,6 @@ def flash_attn_kernel_v2(
         # Q[2]  ✓     ✓     ✗     ✗     ✗    ← hi = 2*BLOCK_M
         # Q[3]  ✓     ✓     ✓     ✗     ✗    ← hi = 3*BLOCK_M
         # Q[4]  ✓     ✓     ✓     ✓     ✗    ← hi = 4*BLOCK_M
-        # lo, hi = 0, start_m * BLOCK_M
         lo = 0
         hi = tl.minimum((start_m + 1) * BLOCK_M, N_CTX)
     else:
@@ -159,10 +158,8 @@ def flash_attn_kernel_v2(
         qk = tl.dot(q, k)
 
         if IS_CAUSAL:
-            if start_n >= start_m * BLOCK_M:
-                _offs_n = start_n + offs_n
-                mask = offs_m[:, None] >= _offs_n[None, :]
-                qk = tl.where(mask, qk, float("-inf"))
+            causal_mask = offs_m[:, None] >= (start_n + offs_n)
+            qk = tl.where(causal_mask, qk, float("-inf"))
 
         m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
         qk = qk * qk_scale - m_ij[:, None]
