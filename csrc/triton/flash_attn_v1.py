@@ -4,6 +4,24 @@ import triton
 import triton.language as tl
 
 
+configs = [
+    triton.Config({"BLOCK_M": BM, "BLOCK_N": BN}, num_stages=s, num_warps=w)
+    for BM in [64, 128]
+    for BN in [32, 64]
+    for s in ([3, 4, 7])
+    for w in [4, 8]
+]
+
+
+def keep(conf):
+    BLOCK_M = conf.kwargs["BLOCK_M"]
+    BLOCK_N = conf.kwargs["BLOCK_N"]
+    if BLOCK_M * BLOCK_N < 128 * 128 and conf.num_warps == 8:
+        return False
+    return True
+
+
+@triton.autotune(list(filter(keep, configs)), key=["N_CTX", "HEAD_DIM"])
 @triton.jit
 def flash_attn_kernel_v1(
     Q_ptr,
@@ -126,17 +144,16 @@ def flash_attn_v1(
     assert q.dtype in [torch.float16, torch.bfloat16, torch.float32]
     assert q.is_cuda, "Input must be on CUDA"
 
-    B, H, N, D = q.shape
-
-    scale = 1.0 / math.sqrt(D)
+    scale = 1.0 / math.sqrt(q.shape[-1])
 
     o = torch.empty_like(q)
 
-    BLOCK_SIZE_M = 64
-    BLOCK_SIZE_N = 64
+    grid = lambda META: (
+        q.shape[0],
+        q.shape[1],
+        triton.cdiv(q.shape[2], META["BLOCK_M"]),
+    )
 
-    num_q_blocks = triton.cdiv(N, BLOCK_SIZE_M)
-    grid = (B, H, num_q_blocks)
     flash_attn_kernel_v1[grid](
         q,
         k,
@@ -159,10 +176,8 @@ def flash_attn_v1(
         o.stride(2),
         o.stride(3),
         sm_scale=scale,
-        N_CTX=N,
-        HEAD_DIM=D,
-        BLOCK_M=BLOCK_SIZE_M,
-        BLOCK_N=BLOCK_SIZE_N,
+        N_CTX=q.shape[2],
+        HEAD_DIM=q.shape[-1],
         IS_CAUSAL=causal,
     )
 

@@ -27,6 +27,7 @@ def keep(conf):
     return True
 
 
+# the shape of (Q K V) is [batch_size, head_size, n_ctx, head_dim]
 @triton.autotune(list(filter(keep, configs)), key=["N_CTX", "HEAD_DIM"])
 @triton.jit
 def flash_attn_kernel_v2(
@@ -62,7 +63,7 @@ def flash_attn_kernel_v2(
     tl.static_assert(BLOCK_N <= HEAD_DIM)
 
     start_m = tl.program_id(0)  # 1 / tl.div(N_CTX, BLOCK_M)
-    off_hz = tl.program_id(1)  # 1 / batch_size * head_size tiles
+    off_hz = tl.program_id(1)  # 1 / batch_size * head_size
 
     # programs is B * H
     off_z = off_hz // H
@@ -82,6 +83,7 @@ def flash_attn_kernel_v2(
         order=(1, 0),
     )
 
+    # spilt k block and transpose K tensor
     K_block_ptr = tl.make_block_ptr(
         base=K_ptr + k_offset,
         shape=(HEAD_DIM, N_CTX),
@@ -117,7 +119,6 @@ def flash_attn_kernel_v2(
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)  # result
 
-    # load scales
     qk_scale = sm_scale
     # qk_scale *= 1.44269504  # 1/log(2)
 
@@ -154,27 +155,26 @@ def flash_attn_kernel_v2(
             causal_mask = offs_m[:, None] >= (start_n + offs_n)
             qk = tl.where(causal_mask, qk, float("-inf"))
 
-        # current max
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
 
-        # Q @ K * qk_scale - max
         qk = qk * qk_scale - m_ij[:, None]
         p = tl.exp(qk)
-        l_ij = tl.sum(p, 1)
 
         alpha = tl.exp(m_i - m_ij)
 
-        # update l_i and acc
-        l_i = l_i * alpha + l_ij
-        acc = acc * alpha[:, None]
+        # update l_i and m_i
+        l_i = l_i * alpha
+        l_ij = tl.sum(p, 1)
+        l_i += l_ij
+        m_i = m_ij
 
         # update acc
+        acc = acc * alpha[:, None]
         v = tl.load(V_block_ptr, boundary_check=(0, 1))
         p = p.to(tl.float16)
         acc = tl.dot(p, v, acc)
 
-        # update m_i
-        m_i = m_ij
+        # remove k v ptr
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
 
