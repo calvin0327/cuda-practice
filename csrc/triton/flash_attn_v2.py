@@ -10,9 +10,6 @@ except ImportError:
     from flash_attn_v1 import attention_reference
 
 
-# We don't run auto-tuning every time to keep the tutorial fast. Keeping
-# the code below and commenting out the equivalent parameters is convenient for
-# re-tuning.
 configs = [
     triton.Config({"BLOCK_M": BM, "BLOCK_N": BN}, num_stages=s, num_warps=w)
     for BM in [64, 128]
@@ -122,9 +119,9 @@ def flash_attn_kernel_v2(
 
     # load scales
     qk_scale = sm_scale
-    qk_scale *= 1.44269504  # 1/log(2)
+    # qk_scale *= 1.44269504  # 1/log(2)
 
-    q = tl.load(Q_block_ptr, boundary_check=(0, 1))
+    q = tl.load(Q_block_ptr)
 
     if IS_CAUSAL:
         # Causal Attention (IS_CAUSAL=True):
@@ -147,31 +144,28 @@ def flash_attn_kernel_v2(
         # Q[4]  ✓     ✓     ✓     ✓     ✓
         lo, hi = 0, N_CTX
 
-    K_block_ptr = tl.advance(K_block_ptr, (0, lo))
-    V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
-
-    for start_n in range(lo, hi, BLOCK_N):
+    for start_n in tl.range(lo, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
 
-        # -- compute qk ----
-        k = tl.load(K_block_ptr, boundary_check=(0, 1))
+        k = tl.load(K_block_ptr)
         qk = tl.dot(q, k)
 
         if IS_CAUSAL:
             causal_mask = offs_m[:, None] >= (start_n + offs_n)
             qk = tl.where(causal_mask, qk, float("-inf"))
 
-        m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
-        qk = qk * qk_scale - m_ij[:, None]
+        # current max
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
 
-        p = tl.math.exp2(qk)
+        # Q @ K * qk_scale - max
+        qk = qk * qk_scale - m_ij[:, None]
+        p = tl.exp(qk)
         l_ij = tl.sum(p, 1)
 
-        # -- update m_i and l_i
-        alpha = tl.math.exp2(m_i - m_ij)
-        l_i = l_i * alpha + l_ij
+        alpha = tl.exp(m_i - m_ij)
 
-        # -- update output accumulator --
+        # update l_i and acc
+        l_i = l_i * alpha + l_ij
         acc = acc * alpha[:, None]
 
         # update acc
@@ -179,7 +173,7 @@ def flash_attn_kernel_v2(
         p = p.to(tl.float16)
         acc = tl.dot(p, v, acc)
 
-        # update m_i and l_i
+        # update m_i
         m_i = m_ij
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
