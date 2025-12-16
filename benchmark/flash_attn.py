@@ -12,7 +12,7 @@ def get_perf_config():
         configs.append(
             triton.testing.Benchmark(
                 x_names=["N_CTX"],
-                x_vals=[2**i for i in range(2, 12)],
+                x_vals=[2**i for i in range(2, 6)],
                 line_arg="provider",
                 line_vals=[
                     "pytorch attn",
