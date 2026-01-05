@@ -5,9 +5,6 @@
 
 #include <cute/tensor.hpp>
 
-#include "detail/cublaslt-gemm.h"
-#include "detail/data.h"
-
 // from reed-lau
 template <typename Config>
 __global__ void /* __launch_bounds__(128, 1) */
