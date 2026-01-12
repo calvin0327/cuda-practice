@@ -22,6 +22,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("sgemm_shared_f32", torch::kCUDA, &sgemm_shared_f32);
   ops.def("sgemm_t_8x8_shared_f32x4(Tensor a, Tensor b, Tensor c) -> ()");
   ops.impl("sgemm_t_8x8_shared_f32x4", torch::kCUDA, &sgemm_t_8x8_shared_f32x4);
+
+  ops.def("flash_attn_v2_cute_v1(Tensor Q, Tensor K, Tensor V, Tensor O) ->()");
+  ops.impl("flash_attn_v2_cute_v1", torch::kCUDA, &flash_attn_v2_cute_v1);
+  ops.def("flash_attn_v2_cute_v2(Tensor Q, Tensor K, Tensor V, Tensor O) ->()");
+  ops.impl("flash_attn_v2_cute_v2", torch::kCUDA, &flash_attn_v2_cute_v2);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

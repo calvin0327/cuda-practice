@@ -8,7 +8,6 @@
 #include <thrust/host_vector.h>
 #include <cute/tensor.hpp>
 #include <cute/util/print.hpp>
-#include <cute/tensor.hpp>
 
 #include "../utils.h"
 

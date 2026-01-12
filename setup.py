@@ -49,20 +49,28 @@ def get_extensions():
         extra_compile_args["nvcc"].append("-g")
         extra_link_args.extend(["-O0", "-g"])
 
-    this_dir = os.path.dirname(os.path.curdir)
+    this_dir = os.path.dirname(os.path.abspath(__file__))
     extensions_dir = os.path.join(this_dir, "csrc")
+    include_dir = os.path.abspath(os.path.join(this_dir, "include"))
     sources = list(glob.glob(os.path.join(extensions_dir, "*.cpp")))
 
     cuda_dir = os.path.join(extensions_dir, "cuda")
     cuda_sources = list(glob.glob(os.path.join(cuda_dir, "*.cu")))
 
+    cute_dir = os.path.join(extensions_dir, "cute")
+    flash_attn_v2_sources = list(
+        glob.glob(os.path.join(cute_dir, "flash_attn_s80_*.cu")),
+    )
+
     if use_cuda:
         sources += cuda_sources
+        sources += flash_attn_v2_sources
 
     ext_modules = [
         extension(
             f"{library_name}._C",
             sources,
+            include_dirs=[include_dir],
             extra_compile_args=extra_compile_args,
             extra_link_args=extra_link_args,
             py_limited_api=py_limited_api,

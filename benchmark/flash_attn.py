@@ -1,6 +1,8 @@
 import torch
 import triton
 
+from ops import ops
+
 from csrc.triton.flash_attn_v1 import attention_reference, flash_attn_v1
 from csrc.triton.flash_attn_v2 import flash_attn_v2
 
@@ -8,23 +10,27 @@ from csrc.triton.flash_attn_v2 import flash_attn_v2
 def get_perf_config():
     batch, n_heads, head_dim = 4, 32, 64
     configs = []
-    for causal in [True, False]:
+    # for causal in [True, False]:
+    for causal in [False]:
         configs.append(
             triton.testing.Benchmark(
                 x_names=["N_CTX"],
-                x_vals=[2**i for i in range(2, 6)],
+                x_vals=[128 * i for i in range(2, 10)],
+                # x_vals=[2**i for i in range(2, 6)],
                 line_arg="provider",
                 line_vals=[
                     "pytorch attn",
                     "triton flash-attn-v1",
                     "triton flash-attn-v2",
+                    "cute flash-attn-v2",
                 ],
                 line_names=[
                     "Pytorch attn [FP16]",
                     "Triton flash-attn-v1 [FP16]",
                     "Triton flash-attn-v2 [FP16]",
+                    "Cute flash-attn-v2 [FP16]",
                 ],
-                styles=[("red", "-"), ("blue", "-"), ("green", "-")],
+                styles=[("red", "-"), ("blue", "-"), ("green", "-"), ("pink", "-")],
                 ylabel="TFLOPS",
                 plot_name=f"flash-attention-batch{batch}-head{n_heads}-d{head_dim}-causal={causal}",
                 args={
@@ -56,6 +62,8 @@ def benchmark(B, H, N_CTX, D, provider, causal):
         fn = lambda: flash_attn_v1(q, k, v, causal)
     elif provider == "triton flash-attn-v2":
         fn = lambda: flash_attn_v2(q, k, v, causal)
+    elif provider == "cute flash-attn-v2":
+        fn = lambda: ops.flash_attn_v2_cute_v2(q, k, v, causal)
     else:
         raise ValueError(f"Unknown provider: {provider}")
 
