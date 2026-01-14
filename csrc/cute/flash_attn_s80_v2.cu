@@ -674,7 +674,7 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
   // Apply scaling factor: Q = Q / sqrt(head_dim)
   // This scaling is part of the attention formula: softmax(Q @ K^T / sqrt(d))
   // We scale Q here to avoid scaling during each Q@K^T computation
-  cp_async_wait(0);
+  cp_async_wait<0>();
   for (int i = 0; i < size(tQsQ); i++) {
     tQsQ(i) = static_cast<T>(scaler) * tQsQ(i);
   }
@@ -687,7 +687,7 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
     clear(tSrS);
 
     // wait current K block from global memory to shared memory
-    cp_async_wait(0);
+    cp_async_wait<0>();
     __syncthreads();  // Ensure previous operations complete
 
     // async copy current V to smem
@@ -708,7 +708,7 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
     }
 
     // wait block V to shared memory
-    cp_async_wait(0);
+    cp_async_wait<0>();
     __syncthreads();  // Ensure all threads finish loading K
 
     // async copy the next K to smem
