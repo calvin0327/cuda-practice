@@ -109,10 +109,9 @@ struct FlashAttnConfig {
           GenRowMajor{}),  // thr_layout
       make_layout(Shape<_1, Int<GmemValsPerLoad>>{})));
 
-  // 8x64
   using SmemLayoutAtom = decltype(composition(
       Swizzle<3, 3, 3>{},
-      make_layout(Shape<Int<8>, Int<64>>{}, GenRowMajor{})));
+      make_layout(Shape<Int<8>, Int<HeadDim>>{}, GenRowMajor{})));
 
   using SmemLayoutQO = decltype(tile_to_shape(
       SmemLayoutAtom{}, make_shape(Int<BlockQO>{}, Int<HeadDim>{})));
@@ -120,10 +119,9 @@ struct FlashAttnConfig {
   using SmemLayoutKV = decltype(tile_to_shape(
       SmemLayoutAtom{}, make_shape(Int<BlockKV>{}, Int<HeadDim>{})));
 
-  // 64x8
   using SmemLayoutAtomTranspose = decltype(composition(
       Swizzle<3, 3, 3>{},
-      make_layout(Shape<Int<64>, Int<8>>{}, GenColMajor{})));
+      make_layout(Shape<Int<HeadDim>, Int<8>>{}, GenColMajor{})));
 
   // TODO: GenRowMajor or GenColMajor?
   using SmemLayoutVt = decltype(tile_to_shape(
@@ -453,7 +451,7 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
 
   // Step 2: Define Shared Memory Layout
   // Allocate shared memory buffers for Q, K, V blocks
-  extern __shared__ unsigned char alignas(T) smem[];
+  extern __shared__ unsigned char smem[];
   T* sQ_ptr = reinterpret_cast<T*>(smem);
   T* sK_ptr = sQ_ptr + cosize(SmemLayoutQO{});
   T* sV_ptr = sK_ptr + cosize(SmemLayoutKV{});
@@ -712,7 +710,7 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
     __syncthreads();  // Ensure all threads finish loading K
 
     // async copy the next K to smem
-    if (blkKVIdx < size(tQsQ)) {
+    if (blkKVIdx < size<2>(gK) - 1) {
       copy(gmem_tiled_copy, tKgK(_, _, _, blkKVIdx + 1), tKsK);
       cp_async_fence();
     }
