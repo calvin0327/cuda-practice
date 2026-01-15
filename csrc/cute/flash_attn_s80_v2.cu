@@ -94,16 +94,13 @@ struct FlashAttnConfig {
   // Number of threads needed per row to cover HeadDim elements
   static constexpr int GmemThreadsPerRow = 64 / GmemValsPerLoad;
 
-  // Copy atom for transferring data from global memory to shared memory
-  using GmemCopyAtom = Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>, T>;
-
   // Tiled copy configuration: 16x64
   //   First parameter: Copy atom - how much data per instruction
   //   Second parameter: Thread layout - how threads are arranged (each thread
   //      executes once)
   //   Third parameter: Number of instructions per thread
   using TiledCopyQKVO = decltype(make_tiled_copy(
-      GmemCopyAtom{},
+      Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>, T>{},
       make_layout(
           Shape<Int<NumThreads / GmemThreadsPerRow>, Int<GmemThreadsPerRow>>{},
           GenRowMajor{}),  // thr_layout
@@ -141,12 +138,6 @@ struct FlashAttnConfig {
   // operand for computing S @ V^T, but we want S @ V (no transpose needed)
   using SmemCopyAtomTransposed = Copy_Atom<SM75_U16x8_LDSM_T, T>;
 
-  // Copy atom for writing computed results back to global memory
-  // TODO: Would using tiled copy be faster?
-  using SmemCopyAtomO =
-      Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<sizeof(uint128_t) * 8>,
-                T>;
-
   static_assert(std::is_same_v<T, half_t> || std::is_same_v<T, bfloat16_t>);
 
   // MMA (Matrix Multiply-Accumulate) atom configuration
@@ -166,6 +157,21 @@ struct FlashAttnConfig {
   using TiledMMA = decltype(make_tiled_mma(
       MMA_Atom{}, make_layout(Shape<Int<NWarpsPerSM>, _1, _1>{}, GenRowMajor{}),
       Tile<Int<16 * NWarpsPerSM>, _16, _16>{}));
+
+  // TODO: 下面两个有什么区别？
+  // using ToSmemCopyAtomO =
+  //     Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<sizeof(uint128_t) *
+  //     8>,
+  //               T>;
+  using ToSmemCopyAtomO =
+      Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, T>;
+
+  using ToGmemCopyAtomO = decltype(make_tiled_copy(
+      Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, T>{},
+      make_layout(
+          Shape<Int<NumThreads / GmemThreadsPerRow>, Int<GmemThreadsPerRow>>{},
+          GenRowMajor{}),  // thr_layout
+      make_layout(Shape<_1, Int<GmemValsPerLoad>>{})));
 
   static_assert(
       16 * NWarpsPerSM <= BlockQO && 16 <= BlockKV && 16 <= HeadDim,
@@ -388,7 +394,9 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
   using TiledMMA = typename FlashAttnConfig_::TiledMMA;
 
   // Copy atom for output: copy O to shared memory first for better performance
-  using SmemCopyAtomO = typename FlashAttnConfig_::SmemCopyAtomO;
+  using ToSmemCopyAtomO = typename FlashAttnConfig_::ToSmemCopyAtomO;
+
+  using ToTiledCopy = typename FlashAttnConfig_::ToGmemCopyAtomO;
 
   // TODO: static check
   assert(HeadDim == D);
@@ -460,6 +468,8 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
   auto sQ = make_tensor(make_smem_ptr(sQ_ptr), SmemLayoutQO{});
   auto sK = make_tensor(make_smem_ptr(sK_ptr), SmemLayoutKV{});
   auto sV = make_tensor(make_smem_ptr(sV_ptr), SmemLayoutKV{});
+
+  auto sO = make_tensor(sQ.data(), SmemLayoutQO{});
 
   // Create transposed view of V in shared memory
   // This is a view-only transformation (no data copy) - Cute's core feature
@@ -799,17 +809,29 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
     print("tOrO: "); print_tensor(tOrO); print("\n");
   }  // clang-format on
 #endif
-  // Copy final output from registers to global memory
-  // TODO: Optimize by first copying to shared memory, then batch writing to
-  // global memory This would improve memory coalescing and reduce global memory
-  // transactions
-  auto tiled_r2s_copy_O = make_tiled_copy_C(SmemCopyAtomO{}, tiled_mma);
+  // first copying to shared memory, then batch writing to global memory This
+  // would improve memory coalescing and reduce global memory transactions
+  auto tiled_r2s_copy_O = make_tiled_copy_C(ToSmemCopyAtomO{}, tiled_mma);
   auto thr_r2s_copy_O = tiled_r2s_copy_O.get_slice(tx);
-  auto tXrO = thr_r2s_copy_O.retile_S(tOrO);  // Retile to match copy layout
-  auto tXgO =
-      thr_r2s_copy_O.partition_D(gO);  // Partition global memory destination
 
-  copy(tiled_r2s_copy_O, tXrO, tXgO);
+  auto tXrO = thr_r2s_copy_O.retile_S(tOrO);  // Retile to match copy layout
+  auto tXsO = thr_r2s_copy_O.partition_D(sO);
+  copy(tiled_r2s_copy_O, tXrO, tXsO);
+  __syncthreads();
+
+  // copy smem sO to gmem gO
+  ToTiledCopy tiled_copy_to_gmem;
+  auto thr_copy_to_gmem = tiled_copy_to_gmem.get_slice(tx);
+  auto tOsO = thr_copy_to_gmem.partition_S(sO);
+  auto tOgO = thr_copy_to_gmem.partition_D(gO);
+
+  // predicate tensor
+  // TODO: N % block = 0，所以不需要掩码
+  // auto cO = make_identity_tensor(make_shape(size<0>(sO), size<1>(sO)));
+  // auto tOcO = thr_copy_to_gmem.partition_S(cO);
+
+  // src -> dst -> predicate
+  copy(tiled_copy_to_gmem, tOsO, tOgO);
 }
 
 // Sanity check function: validates tensor dimensions match
