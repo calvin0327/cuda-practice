@@ -9,20 +9,6 @@
 
 using namespace cute;
 
-// Flash Attention v2 Implementation using CUTLASS Cute
-// This implementation uses online softmax algorithm to compute attention scores
-// without storing the full attention matrix, reducing memory usage from O(N^2)
-// to O(N) for sequence length N.
-//
-// Algorithm overview:
-//   1. Load Q block into shared memory and scale by 1/sqrt(head_dim)
-//   2. For each KV block:
-//      a. Compute S = Q @ K^T (attention scores)
-//      b. Apply online softmax: update running max and sum
-//      c. Compensate previous output and denominator using new max
-//      d. Compute O += softmax(S) @ V
-//   3. Normalize final output by dividing by denominator
-//
 // Ref: https://github.com/xlite-dev/LeetCUDA
 // Ref: https://github.com/izmttk/flash_attention_cute
 
@@ -92,13 +78,9 @@ struct FlashAttnConfig {
   // Calculated based on element type: 128 bits / sizeof(T) elements
   static constexpr int GmemValsPerLoad = sizeof(uint128_t) / sizeof(T);
   // Number of threads needed per row to cover HeadDim elements
-  static constexpr int GmemThreadsPerRow = 64 / GmemValsPerLoad;
+  static constexpr int GmemThreadsPerRow = HeadDim / GmemValsPerLoad;
 
-  // Tiled copy configuration: 16x64
-  //   First parameter: Copy atom - how much data per instruction
-  //   Second parameter: Thread layout - how threads are arranged (each thread
-  //      executes once)
-  //   Third parameter: Number of instructions per thread
+  // Tiled copy: copy atom, thread layout, instructions per thread
   using TiledCopyQKVO = decltype(make_tiled_copy(
       Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>, T>{},
       make_layout(
@@ -110,17 +92,22 @@ struct FlashAttnConfig {
       Swizzle<3, 3, 3>{},
       make_layout(Shape<Int<8>, Int<HeadDim>>{}, GenRowMajor{})));
 
-  using SmemLayoutQO = decltype(tile_to_shape(
+  using SmemLayoutQ = decltype(tile_to_shape(
+      SmemLayoutAtom{}, make_shape(Int<BlockQO>{}, Int<HeadDim>{})));
+  using SmemLayoutO = decltype(tile_to_shape(
       SmemLayoutAtom{}, make_shape(Int<BlockQO>{}, Int<HeadDim>{})));
 
-  using SmemLayoutKV = decltype(tile_to_shape(
+  using SmemLayoutK = decltype(tile_to_shape(
+      SmemLayoutAtom{}, make_shape(Int<BlockKV>{}, Int<HeadDim>{})));
+  using SmemLayoutV = decltype(tile_to_shape(
       SmemLayoutAtom{}, make_shape(Int<BlockKV>{}, Int<HeadDim>{})));
 
+  // Use GenColMajor to create transposed view of V
   using SmemLayoutAtomTranspose = decltype(composition(
       Swizzle<3, 3, 3>{},
       make_layout(Shape<Int<HeadDim>, Int<8>>{}, GenColMajor{})));
 
-  // TODO: GenRowMajor or GenColMajor?
+  // GenRowMajor refers to SmemLayoutAtomTranspose arrangement
   using SmemLayoutVt = decltype(tile_to_shape(
       SmemLayoutAtomTranspose{}, make_shape(Int<HeadDim>{}, Int<BlockKV>{}),
       GenRowMajor{}));
@@ -128,46 +115,32 @@ struct FlashAttnConfig {
   static_assert(Int<NumThreads / GmemThreadsPerRow>::value <= BlockQO,
                 "NumThreads must be less than or equal to BlockQO");
 
-  // LDSM (Load Data from Shared Memory) copy atom optimized for MMA operations
-  // LDSM is used because it provides efficient loading from shared memory
-  // directly into registers in a format compatible with MMA instructions
+  // LDSM copy atom for shared memory to register (MMA-compatible format)
   using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, T>;
 
-  // Transposed LDSM copy atom for loading V matrix
-  // V needs to be transposed because MMA instruction expects transposed B
-  // operand for computing S @ V^T, but we want S @ V (no transpose needed)
+  // Transposed LDSM for V: MMA expects transposed B, but we compute S @ V
   using SmemCopyAtomTransposed = Copy_Atom<SM75_U16x8_LDSM_T, T>;
 
   static_assert(std::is_same_v<T, half_t> || std::is_same_v<T, bfloat16_t>);
 
-  // MMA (Matrix Multiply-Accumulate) atom configuration
-  // Using 16x8x8 instead of 16x8x16 for simplicity:
-  //   - Both Q@K^T and S@V use the same MMA layout (16x8x8)
-  //   - This avoids needing to adjust tSrS layout to fit tOrS
-  //   - Trade-off: slightly less efficient than 16x8x16, but simpler code
+  // MMA atom: 16x8x8 for simplicity (same layout for Q@K^T and S@V)
   using MMA_Atom = std::conditional_t<std::is_same_v<T, half_t>,
                                       MMA_Atom<SM80_16x8x8_F32F16F16F32_TN>,
                                       MMA_Atom<SM80_16x8x8_F32BF16BF16F32_TN>>;
 
-  // Tiled MMA: combines multiple MMA atoms to cover the full block
-  // For SM75_U32x4_LDSM_N, we need at least 4 * 8x8 = 16x16 matrix
-  // Layout: (NWarpsPerSM warps) × (1 warp) × (1 warp) along M/N/K dimensions
-  // Tile size: (16 * NWarpsPerSM) × 16 × 16 to cover BlockQO × BlockKV ×
+  // Tiled MMA: (16 * NWarpsPerSM) × 16 × 16 to cover BlockQO × BlockKV ×
   // HeadDim
   using TiledMMA = decltype(make_tiled_mma(
       MMA_Atom{}, make_layout(Shape<Int<NWarpsPerSM>, _1, _1>{}, GenRowMajor{}),
       Tile<Int<16 * NWarpsPerSM>, _16, _16>{}));
 
-  // TODO: 下面两个有什么区别？
-  // using ToSmemCopyAtomO =
-  //     Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<sizeof(uint128_t) *
-  //     8>,
-  //               T>;
   using ToSmemCopyAtomO =
-      Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, T>;
+      Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<sizeof(uint128_t) * 8>,
+                T>;
 
   using ToGmemCopyAtomO = decltype(make_tiled_copy(
-      Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, T>{},
+      Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<sizeof(uint128_t) * 8>,
+                T>{},
       make_layout(
           Shape<Int<NumThreads / GmemThreadsPerRow>, Int<GmemThreadsPerRow>>{},
           GenRowMajor{}),  // thr_layout
@@ -190,13 +163,18 @@ struct FlashAttnConfig {
 // For each MMA, threads hold values v0, v1, v2, v3
 // We compute max(v0, v1) and max(v2, v3) per thread first
 template <typename TensorS, typename TensorMax>
-__device__ void compute_local_max(const TensorS& tSrS, TensorMax& max_ij) {
+__device__ void compute_local_max_and_scale(TensorS& tSrS, TensorMax& max_ij,
+                                            const float scaler) {
   CUTE_UNROLL
   for (int val_idx = 0; val_idx < size<0>(tSrS); ++val_idx) {
     CUTE_UNROLL
     for (int row_idx = 0; row_idx < size<1>(tSrS); ++row_idx) {
       CUTE_UNROLL
       for (int col_idx = 0; col_idx < size<2>(tSrS); ++col_idx) {
+        // Scale attention scores: S is F32 (no precision loss), reduces loop
+        // iterations
+        tSrS(val_idx, row_idx, col_idx) *= scaler;
+
         int max_row_idx = val_idx / 2;
         int max_col_idx = row_idx;
         max_ij(max_row_idx, max_col_idx) = max(max_ij(max_row_idx, max_col_idx),
@@ -352,18 +330,8 @@ __device__ void normalize_output(TensorO& tOrO, const TensorMax& l_i) {
   }
 }
 
-// Flash Attention v2 kernel implementation
-// This kernel computes: O = softmax(Q @ K^T / sqrt(d)) @ V
-// using online softmax algorithm to avoid storing full attention matrix
-//
-// Parameters:
-//   Q_ptr, K_ptr, V_ptr, O_ptr: Pointers to Q, K, V, O tensors in global memory
-//   B: Batch size
-//   H: Number of attention heads
-//   N_QO_CTX: Sequence length for Q and O
-//   N_KV_CTX: Sequence length for K and V (can differ for cross-attention)
-//   D: Head dimension
-//   scaler: Scaling factor (typically 1/sqrt(head_dim))
+// Flash Attention v2 kernel: O = softmax(Q @ K^T / sqrt(d)) @ V
+// Uses online softmax to avoid storing full attention matrix
 template <typename FlashAttnConfig_>
 __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
                                      typename FlashAttnConfig_::T* K_ptr,
@@ -374,8 +342,8 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
   // Extract data type from config
   using T = typename FlashAttnConfig_::T;
 
-  // Block size for Q and O are the same (M dimension)
-  // Block size for K and V are the same (KV dimension)
+  // Block size for Q and O are the same
+  // Block size for K and V are the same
   constexpr int BlockQO = FlashAttnConfig_::BlockQO;
   constexpr int BlockKV = FlashAttnConfig_::BlockKV;
   constexpr int HeadDim = FlashAttnConfig_::HeadDim;
@@ -383,8 +351,10 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
   // the tiledCopy to copy global memory to shared memory
   using TiledCopy = typename FlashAttnConfig_::TiledCopyQKVO;
 
-  using SmemLayoutQO = typename FlashAttnConfig_::SmemLayoutQO;
-  using SmemLayoutKV = typename FlashAttnConfig_::SmemLayoutKV;
+  using SmemLayoutQ = typename FlashAttnConfig_::SmemLayoutQ;
+  using SmemLayoutO = typename FlashAttnConfig_::SmemLayoutO;
+  using SmemLayoutK = typename FlashAttnConfig_::SmemLayoutK;
+  using SmemLayoutV = typename FlashAttnConfig_::SmemLayoutV;
   using SmemLayoutVt = typename FlashAttnConfig_::SmemLayoutVt;
 
   // copy shared memory to register
@@ -398,7 +368,7 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
 
   using ToTiledCopy = typename FlashAttnConfig_::ToGmemCopyAtomO;
 
-  // TODO: static check
+  // static check
   assert(HeadDim == D);
 
   // Block indices: x for batch (B), y for head (H), z for sequence block (N)
@@ -409,10 +379,7 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
   // Thread index within the block
   const int tx = threadIdx.x;
 
-  // Step 1: Define Global Memory Tensors
-  // Create Cute tensor views from raw pointers with
-  // row-major layout Shape: [Batch, Head, Sequence, HeadDim]
-  // TODO: Self-define shape layouts for better memory access patterns
+  // Step 1: Define global memory tensors [Batch, Head, Sequence, HeadDim]
   auto Q = make_tensor(
       make_gmem_ptr(Q_ptr),
       make_layout(make_shape(B, H, N_QO_CTX, HeadDim), GenRowMajor{}));
@@ -429,16 +396,8 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
       make_gmem_ptr(V_ptr),
       make_layout(make_shape(B, H, N_KV_CTX, HeadDim), GenRowMajor{}));
 
-  // Extract local tiles from global tensors for this block:
-  //   - gQ/gO: Extract one block of size [BlockQO, HeadDim] for current
-  //   batch/head/seq_block
-  //   - gK/gV: Extract all blocks along sequence dimension, resulting in
-  //   [BlockKV, HeadDim, Num_Blocks] The _ in local_tile preserves the block
-  //   index dimension for K/V
-  //
-  // Shape of gQ and gO: (BlockQO, HeadDim) - single 2D tile
-  // Shape of gK and gV: (BlockKV, HeadDim, Num_Blocks) - multiple tiles along
-  // sequence
+  // Extract local tiles: gQ/gO [BlockQO, HeadDim], gK/gV [BlockKV, HeadDim,
+  // Num_Blocks]
   auto gQ =
       local_tile(Q, make_shape(_1{}, _1{}, Int<BlockQO>{}, Int<HeadDim>{}),
                  make_coord(bx, by, bz, 0))(0, 0, _, _);
@@ -446,10 +405,8 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
       local_tile(O, make_shape(_1{}, _1{}, Int<BlockQO>{}, Int<HeadDim>{}),
                  make_coord(bx, by, bz, 0))(0, 0, _, _);
 
-  // Since we use _ in the SeqLen dimension, local_tile returns a Tensor
-  // with an additional dimension (preserving the block index dimension).
-  // The returned Tensor has the following logical shape:
-  // [Batch(1), Head(1), BlockKV, HeadDim, Num_Blocks]
+  // Using _ in SeqLen preserves block index: [Batch(1), Head(1), BlockKV,
+  // HeadDim, Num_Blocks]
   auto gK =
       local_tile(K, make_shape(_1{}, _1{}, Int<BlockKV>{}, Int<HeadDim>{}),
                  make_coord(bx, by, _, 0))(0, 0, _, _, _);
@@ -457,78 +414,51 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
       local_tile(V, make_shape(_1{}, _1{}, Int<BlockKV>{}, Int<HeadDim>{}),
                  make_coord(bx, by, _, 0))(0, 0, _, _, _);
 
-  // Step 2: Define Shared Memory Layout
-  // Allocate shared memory buffers for Q, K, V blocks
+  // Step 2: Define shared memory layout for Q, K, V blocks
   extern __shared__ unsigned char smem[];
   T* sQ_ptr = reinterpret_cast<T*>(smem);
-  T* sK_ptr = sQ_ptr + cosize(SmemLayoutQO{});
-  T* sV_ptr = sK_ptr + cosize(SmemLayoutKV{});
+  T* sK_ptr = sQ_ptr + cosize(SmemLayoutQ{});
+  T* sV_ptr = sK_ptr + cosize(SmemLayoutK{});
+  auto sQ = make_tensor(make_smem_ptr(sQ_ptr), SmemLayoutQ{});
+  auto sK = make_tensor(make_smem_ptr(sK_ptr), SmemLayoutK{});
+  auto sV = make_tensor(make_smem_ptr(sV_ptr), SmemLayoutV{});
 
-  // Create tensor views over shared memory with row-major layout
-  auto sQ = make_tensor(make_smem_ptr(sQ_ptr), SmemLayoutQO{});
-  auto sK = make_tensor(make_smem_ptr(sK_ptr), SmemLayoutKV{});
-  auto sV = make_tensor(make_smem_ptr(sV_ptr), SmemLayoutKV{});
+  // Reuse Q's memory after computation
+  auto sO = make_tensor(sQ.data(), SmemLayoutO{});
 
-  auto sO = make_tensor(sQ.data(), SmemLayoutQO{});
-
-  // Create transposed view of V in shared memory
-  // This is a view-only transformation (no data copy) - Cute's core feature
-  // Needed because MMA instruction expects transposed B operand, but we compute
-  // S @ V By transposing V in the view, MMA will transpose it back during
-  // computation
+  // Transposed view of V: view-only (no copy), MMA expects transposed B but we
+  // compute S @ V
   auto sVt = make_tensor(make_smem_ptr(sV_ptr), SmemLayoutVt{});
 
-  // Step 3: Define Thread Partitions for Global->Shared
-  // Each thread is responsible for copying a portion
-  // of data from global to shared memory TiledCopy defines how threads
-  // cooperate to copy the entire block
+  // Step 3: Define thread partitions for global->shared copy
   TiledCopy gmem_tiled_copy;
-  // Get this thread's portion of the copy operation
   auto gmem_thr_copy = gmem_tiled_copy.get_slice(tx);
-
-  // Thread partition shape explanation:
-  //   Copy: Number of elements copied per instruction
-  //   BlockMCopy: Number of copy operations along M dimension
-  //   HeadDimCopy: Number of copy operations along K dimension
-
-  // Example: If Tile is 128x64 with 128 threads, total elements = 8192.
-  // Each thread handles 8192 / 128 = 64 elements.
-  // If using CP_ASYNC (8 elements per instruction), each thread executes 8
-  // instructions. Then tQgQ and tQsQ shapes might look like ((8), 4, 2),
-  // meaning:
-  //   (8): 8 elements per instruction
-  //   4: 4 repetitions along M dimension
-  //   2: 2 repetitions along K dimension
-  //   (Note: Which dimension repeats depends on TiledCopy thread layout)
-
-  auto tQgQ =
-      gmem_thr_copy.partition_S(gQ);  // (Copy, BlockQOCopy, HeadDimCopy)
-  auto tQsQ =
-      gmem_thr_copy.partition_D(sQ);  // (Copy, BlockQOCopy, HeadDimCopy)
+  auto tQgQ = gmem_thr_copy.partition_S(gQ);
+  auto tQsQ = gmem_thr_copy.partition_D(sQ);
 
   // (Copy, BlockKVCopy, HeadDimCopy, RestKV)
+  // (Copy, BlockKVCopy, HeadDimCopy, RestKV)
   auto tKgK = gmem_thr_copy.partition_S(gK);
-  auto tKsK =
-      gmem_thr_copy.partition_D(sK);  // (Copy, BlockKVCopy, HeadDimCopy)
+  auto tKsK = gmem_thr_copy.partition_D(sK);
 
   // (Copy, BlockKVCopy, HeadDimCopy, RestKV)
   auto tVgV = gmem_thr_copy.partition_S(gV);
   auto tVsV = gmem_thr_copy.partition_D(sV);
 
-  // Step 4: Define Register-Resident Fragments
-  // These are small tensor fragments stored in thread
-  // registers for MMA operations Each thread holds a portion of Q, K, V, S
-  // (scores), and O (output) in registers
-  //
-  // Fragment naming convention:
-  //   tSr*: Register fragment from shared memory (S = shared, r = register)
-  //   tOr*: Register fragment for output computation
-  //   Shape: (MMA_atom_values, Repetitions_M, Repetitions_K)
-  //
-  // tSrQ Shape: ((Atom_Val_A), Rep_M, Rep_K)
-  //   Atom_Val_A: A matrix elements per thread in one MMA (e.g., 4 for FP16
-  //   16x8x8) Rep_M: BlockQO / Atom_M (e.g., 128/16 = 8 repetitions along M)
-  //   Rep_K: HeadDim / Atom_K (e.g., 64/8 = 8 repetitions along K)
+  CUTE_STATIC_ASSERT_V(size<0>(tQgQ) == size<0>(tQsQ));
+  CUTE_STATIC_ASSERT_V(size<1>(tQgQ) == size<1>(tQsQ));
+  CUTE_STATIC_ASSERT_V(size<2>(tQgQ) == size<2>(tQsQ));
+  CUTE_STATIC_ASSERT_V(size<0>(tKgK) == size<0>(tKsK));
+  CUTE_STATIC_ASSERT_V(size<1>(tKgK) == size<1>(tKsK));
+  CUTE_STATIC_ASSERT_V(size<2>(tKgK) == size<2>(tKsK));
+  // tKgK has 4 dims (includes RestKV), tKsK has 3 dims, so skip size<3> check
+  CUTE_STATIC_ASSERT_V(size<0>(tVgV) == size<0>(tVsV));
+  CUTE_STATIC_ASSERT_V(size<1>(tVgV) == size<1>(tVsV));
+  CUTE_STATIC_ASSERT_V(size<2>(tVgV) == size<2>(tVsV));
+  // tVgV has 4 dims (includes RestKV), tVsV has 3 dims, so skip size<3> check
+
+  // Step 4: Define register fragments for MMA operations
+  // tSr*: register fragment from shared memory, tOr*: output fragment
   TiledMMA tiled_mma;
   auto thr_mma = tiled_mma.get_slice(tx);
 
@@ -539,9 +469,9 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
   auto tSrK = thr_mma.partition_fragment_B(sK);
 
   // Register fragment for attention scores S = Q @ K^T
-  auto tSrS = partition_fragment_C(
-      tiled_mma,
-      Shape<Int<BlockQO>, Int<BlockKV>>{});  // S: (MMA, Rep_M, Rep_KV)
+  // S: (MMA, Rep_M, Rep_KV)
+  auto tSrS =
+      partition_fragment_C(tiled_mma, Shape<Int<BlockQO>, Int<BlockKV>>{});
 
   // Register fragments for output computation O = S @ V
   // V is transposed because MMA expects transposed B operand, but we want S @ V
@@ -552,30 +482,8 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
   auto tOrO =
       partition_fragment_C(tiled_mma, Shape<Int<BlockQO>, Int<HeadDim>>{});
 
-  // Initialize output to zero (will accumulate results from each KV block)
-  clear(tOrO);
-
-  // Step 7: Load and Scale Q Block
-  // Load Q block from global memory to shared memory
-  // performance
-  copy(gmem_tiled_copy, tQgQ, tQsQ);
-  copy(gmem_tiled_copy, tKgK(_, _, _, 0), tKsK);
-  cp_async_fence();
-
-  // Step 8: Main Loop - Process Each KV Block
-  // Flash Attention processes K and V in blocks to reduce
-  // memory usage For each KV block:
-  //   1. Compute attention scores S = Q @ K^T
-  //   2. Apply online softmax (update max and sum)
-  //   3. Compensate previous output using new max
-  //   4. Accumulate O += softmax(S) @ V
-
-  // Step 5: Define Shared Memory to Register Copy Operations
-  // Create tiled copy operations to transfer
-  // data from shared memory to registers Critical: The layout in shared memory
-  // doesn't match MMA register layout make_tiled_copy_A/B automatically adjusts
-  // the layout during copy to match MMA requirements This is why we need
-  // separate copy operations for Q, K, V
+  // Step 5: Define shared memory to register copy operations
+  // Layout automatically adjusted to match MMA requirements
   auto tiled_s2r_copy_Q = make_tiled_copy_A(SmemCopyAtom{}, tiled_mma);
   auto thr_s2r_copy_Q = tiled_s2r_copy_Q.get_slice(tx);
   auto tXsQ = thr_s2r_copy_Q.partition_S(sQ);
@@ -591,6 +499,14 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
   auto tXsVt = thr_s2r_copy_V.partition_S(sVt);
   auto tXrVt = thr_s2r_copy_V.retile_D(tOrVt);  // (CPY, MMA_Headdim, MMA_QO)
 
+  // Step 7: Load and scale Q block: Q = Q / sqrt(head_dim)
+  copy(gmem_tiled_copy, tQgQ, tQsQ);
+  copy(gmem_tiled_copy, tKgK(_, _, _, 0), tKsK);
+  cp_async_fence();
+
+  // Initialize output to zero (will accumulate results from each KV block)
+  clear(tOrO);
+
 #ifdef FLASH_ATTN_MMA_DEBUG
   if (thread0()) {  // clang-format off
     print("NumThreads: "); print(FlashAttnConfig_::NumThreads); print("\n");
@@ -598,49 +514,43 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
     print("tiled_copy: "); print(tiled_copy); print("\n");
     print("GmemValsPerLoad: "); print(FlashAttnConfig_::GmemValsPerLoad); print("\n");
     print("GmemThreadsPerRow: "); print(FlashAttnConfig_::GmemThreadsPerRow); print("\n");
-    print("gQ: "); print(gQ.layout()); print("\n");
-    print("gK: "); print(gK.layout()); print("\n");
-    print("gV: "); print(gV.layout()); print("\n");
-    print("sQ: "); print(sQ.layout()); print("\n");
-    print("sK: "); print(sK.layout()); print("\n");
-    print("sV: "); print(sV.layout()); print("\n");
 
-    print("tQgQ: "); print(tQgQ.layout()); print("\n");
-    print("tQsQ: "); print(tQsQ.layout()); print("\n");
-    print("tKsK: "); print(tKsK.layout()); print("\n");
-    print("tKgK: "); print(tKgK.layout()); print("\n");
-    print("tVsV: "); print(tVsV.layout()); print("\n");
+    CUTE_PRINT("gQ", gQ.layout());
+    CUTE_PRINT("gK", gK.layout());
+    CUTE_PRINT("gV", gV.layout());
+    CUTE_PRINT("sQ", sQ.layout());
+    CUTE_PRINT("sK", sK.layout());
+    CUTE_PRINT("sV", sV.layout());
 
-    print("tSrQ: "); print(tSrQ.layout()); print("\n");
-    print("tSrK: "); print(tSrK.layout()); print("\n");
-    print("tSrS: "); print(tSrS.layout()); print("\n");
-    print("tOrVt: "); print(tOrVt.layout()); print("\n");
-    print("tOrO: "); print(tOrO.layout()); print("\n");
+    CUTE_PRINT("tQgQ", tQgQ.layout());
+    CUTE_PRINT("tQsQ", tQsQ.layout());
+    CUTE_PRINT("tKsK", tKsK.layout());
+    CUTE_PRINT("tKgK", tKgK.layout());
+    CUTE_PRINT("tVsV", tVsV.layout());
+
+    CUTE_PRINT("tSrQ", tSrQ.layout());
+    CUTE_PRINT("tSrK", tSrK.layout());
+    CUTE_PRINT("tSrS", tSrS.layout());
+    CUTE_PRINT("tOrVt", tOrVt.layout());
+    CUTE_PRINT("tOrO", tOrO.layout());
 
     print("tiled_s2r_copy_Q: "); print(tiled_s2r_copy_Q); print("\n");
-    print("tXsQ: "); print(tXsQ.layout()); print("\n");
-    print("tXrQ: "); print(tXrQ.layout()); print("\n");
+    CUTE_PRINT("tXsQ", tXsQ.layout());
+    CUTE_PRINT("tXrQ", tXrQ.layout());
+
     print("tiled_s2r_copy_K: "); print(tiled_s2r_copy_K); print("\n");
-    print("tXsK: "); print(tXsK.layout()); print("\n");
-    print("tXrK: "); print(tXrK.layout()); print("\n");
-    print("tiled_s2r_copy_V: "); print(tiled_s2r_copy_V); print("\n");
-    print("tXsVt: "); print(tXsVt.layout()); print("\n");
-    print("tXrVt: "); print(tXrVt.layout()); print("\n");
+    CUTE_PRINT("tXsK", tXsK.layout());
+    CUTE_PRINT("tXrK", tXrK.layout());
+    print("tiled_s2r_copy_V: "); print(tiled_s2r_copy_V);
+    CUTE_PRINT("tXsVt", tXsVt.layout());
+    CUTE_PRINT("tXrVt", tXrVt.layout());
   }  // clang-format on
 #endif
-  // Step 6: Initialize Online Softmax State
-  // Online softmax algorithm maintains running statistics:
-  //   max_i: Running maximum for each row (used for numerical stability)
-  //   l_i: Running sum of exp(scores - max) for each row (denominator)
-  //
-  // For SM80 MMA, each thread owns 2 rows of C matrix:
-  // Shape: (_2{}, Rep_M) where:
-  //   _2{}: Each thread handles 2 rows per MMA (v0, v1 and v2,v3)
-  //   Rep_M: Number of MMA repetitions along M dimension
-  //       [v0, v1]
-  //       ......
-  //       [v2, v3]
-  // Single MMA 16x8x16 output matrix:
+
+  // Step 6: Initialize online softmax state
+  // max_i: running maximum per row, l_i: running sum of exp(scores - max)
+  // Shape: (_2{}, Rep_M) - each thread handles 2 rows per MMA
+  // Single MMA 16x8x16 output matrix :
   // ┌───────────────────────────────────────────────────────────────────┐
   // │              MMA 16x8x16 Output Matrix (16 rows × 8 cols)         │
   // ├───────────────────────────────────────────────────────────────────┤
@@ -666,27 +576,10 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
   // │                    (T0-T3, T4-T7, ...)                            │
   // │                                                                   │
   // └───────────────────────────────────────────────────────────────────┘
-  // max_i shape explanation: (_2{}, Int<size<1>(tSrS){})
-  //   First dimension (2): Each thread participates in 2 rows per MMA
-  //   instruction.
-  //   If there are repetitions along N dimension, they will be reduced.
-  //   Second dimension (size<1>(tSrS)): Multiple repeated MMAs along M
-  //   dimension. So max_i[0] stores max values for the 2 rows this thread
-  //   handles in each MMA tile, and max_i[1] represents multiple MMAs along the
-  //   M dimension.
   auto max_i = make_tensor<float>(make_shape(_2{}, Int<size<1>(tSrS)>{}));
   fill(max_i, -1e20);
   auto l_i = make_tensor<float>(make_shape(_2{}, Int<size<1>(tSrS)>{}));
   fill(l_i, 0);
-
-  // Apply scaling factor: Q = Q / sqrt(head_dim)
-  // This scaling is part of the attention formula: softmax(Q @ K^T / sqrt(d))
-  // We scale Q here to avoid scaling during each Q@K^T computation
-  cp_async_wait<0>();
-  for (int i = 0; i < size(tQsQ); i++) {
-    tQsQ(i) = static_cast<T>(scaler) * tQsQ(i);
-  }
-  __syncthreads();  // Ensure all threads finish loading and scaling Q
 
   for (int blkKVIdx = 0; blkKVIdx < size<2>(gK); ++blkKVIdx) {
     // TODO: Implement causal masking (for autoregressive models)
@@ -694,7 +587,7 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
     // Clear attention scores for current KV block
     clear(tSrS);
 
-    // wait current K block from global memory to shared memory
+    // wait current Q and K block from global memory to shared memory
     cp_async_wait<0>();
     __syncthreads();  // Ensure previous operations complete
 
@@ -712,6 +605,7 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
         copy(tiled_s2r_copy_Q, tXsQ(_, _, blkIdx + 1), tXrQ(_, _, blkIdx + 1));
         copy(tiled_s2r_copy_K, tXsK(_, _, blkIdx + 1), tXrK(_, _, blkIdx + 1));
       }
+
       gemm(tiled_mma, tSrQ(_, _, blkIdx), tSrK(_, _, blkIdx), tSrS);
     }
 
@@ -730,7 +624,8 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
     // We compute max(v0, v1) and max(v2, v3) per thread first
     auto max_ij = make_fragment_like(max_i);  // Max for current block
     fill(max_ij, -1e20);
-    compute_local_max(tSrS, max_ij);
+
+    compute_local_max_and_scale(tSrS, max_ij, scaler);
 
     // Reduce maximum across 4 threads that share the same row
     reduce_max_across_threads(max_ij, tSrS);
@@ -781,15 +676,15 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
 #ifdef FLASH_ATTN_MMA_DEBUG
     if (thread0()) {  // clang-format off
       print("blkKVIdx: "); print(blkKVIdx); print("\n");
-      print("tXrQ: "); print_tensor(tXrQ); print("\n");
-      print("tSrQ: "); print_tensor(tSrQ); print("\n");
-      print("tXrK: "); print_tensor(tXrK); print("\n");
-      print("tSrK: "); print_tensor(tSrK); print("\n");
-      print("tSrS: "); print_tensor(tSrS); print("\n");
-      print("max_ij: "); print_tensor(max_ij); print("\n");
-      print("l_i: "); print_tensor(l_i); print("\n");
-      print("tOrVt: "); print_tensor(tOrVt); print("\n");
-      print("tOrO: "); print_tensor(tOrO); print("\n");
+      CUTE_PRINTTENSOR("tXrQ", tXrQ);
+      CUTE_PRINTTENSOR("tSrQ", tSrQ);
+      CUTE_PRINTTENSOR("tXrK", tXrK);
+      CUTE_PRINTTENSOR("tSrK", tSrK);
+      CUTE_PRINTTENSOR("tSrS", tSrS);
+      CUTE_PRINTTENSOR("max_ij", max_ij);
+      CUTE_PRINTTENSOR("l_i", l_i); 
+      CUTE_PRINTTENSOR("tOrVt", tOrVt);
+      CUTE_PRINTTENSOR("tOrO", tOrO); 
     }  // clang-format on
 #endif
   }
@@ -805,10 +700,12 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
   normalize_output(tOrO, l_i);
 #ifdef FLASH_ATTN_MMA_DEBUG
   if (thread0()) {  // clang-format off
-    print("l_i: "); print_tensor(l_i); print("\n");
-    print("tOrO: "); print_tensor(tOrO); print("\n");
+    print("l_i", l_i);
+    print("tOrO", tOrO);
   }  // clang-format on
 #endif
+
+  __syncthreads();
   // first copying to shared memory, then batch writing to global memory This
   // would improve memory coalescing and reduce global memory transactions
   auto tiled_r2s_copy_O = make_tiled_copy_C(ToSmemCopyAtomO{}, tiled_mma);
@@ -816,6 +713,8 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
 
   auto tXrO = thr_r2s_copy_O.retile_S(tOrO);  // Retile to match copy layout
   auto tXsO = thr_r2s_copy_O.partition_D(sO);
+
+  // Cute automatically converts FP32 (tXrO) to FP16 (tXsO)
   copy(tiled_r2s_copy_O, tXrO, tXsO);
   __syncthreads();
 
@@ -825,19 +724,11 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
   auto tOsO = thr_copy_to_gmem.partition_S(sO);
   auto tOgO = thr_copy_to_gmem.partition_D(gO);
 
-  // predicate tensor
-  // TODO: N % block = 0，所以不需要掩码
-  // auto cO = make_identity_tensor(make_shape(size<0>(sO), size<1>(sO)));
-  // auto tOcO = thr_copy_to_gmem.partition_S(cO);
-
-  // src -> dst -> predicate
+  // TODO: N % block = 0, so no mask needed
   copy(tiled_copy_to_gmem, tOsO, tOgO);
 }
 
-// Sanity check function: validates tensor dimensions match
-// This kernel only implements limited functionality (self-attention with fixed
-// block sizes) For cross-attention (N_QO != N_KV), additional modifications are
-// needed
+// Sanity check: validates tensor dimensions match (self-attention only)
 static bool sanity_check(torch::Tensor& Q, torch::Tensor& K, torch::Tensor& V,
                          torch::Tensor& O) {
   const int bq = Q.size(0);  // B, H, N, d
@@ -882,7 +773,6 @@ static bool sanity_check(torch::Tensor& Q, torch::Tensor& K, torch::Tensor& V,
 }
 
 // Launch kernel with specific configuration
-// Template parameters define the block sizes and thread organization
 template <int BlockQO, int BlockKV, int HeadDim, int NWarpsPerSM>
 static void launch_kernel(torch::Tensor& Q, torch::Tensor& K, torch::Tensor& V,
                           torch::Tensor& O) {
@@ -898,7 +788,7 @@ static void launch_kernel(torch::Tensor& Q, torch::Tensor& K, torch::Tensor& V,
   // Compute scaling factor: 1/sqrt(head_dim) for attention
   float scaler = 1.0 / sqrt(d);
 
-  // TODO: 支持任意 N 的值
+  // TODO: Support arbitrary N values
   assert(n % BlockQO == 0);  // Sequence length must be divisible by block size
 
   // Grid configuration: (batch, head, sequence_blocks)
@@ -913,8 +803,7 @@ static void launch_kernel(torch::Tensor& Q, torch::Tensor& K, torch::Tensor& V,
   CUDACHECK(cudaGetLastError());
 }
 
-// Main entry point for Flash Attention v2
-// Selects appropriate kernel configuration based on head dimension
+// Main entry point: selects kernel configuration based on head dimension
 void flash_attn_v2_cute_v2(torch::Tensor& Q, torch::Tensor& K, torch::Tensor& V,
                            torch::Tensor& O) {
   CHECK_TORCH_TENSOR_DTYPE(Q, torch::kHalf)  // Q [B,H,N,D]
@@ -925,7 +814,6 @@ void flash_attn_v2_cute_v2(torch::Tensor& Q, torch::Tensor& K, torch::Tensor& V,
   const int d = Q.size(3);  // Head dimension
 
   // Select kernel configuration based on head dimension
-  // Different configurations optimize for different head sizes
   switch (d) {
     case 16:
       launch_kernel<128, 128, 16, 8>(Q, K, V, O);

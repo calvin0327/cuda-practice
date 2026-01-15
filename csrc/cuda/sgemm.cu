@@ -11,7 +11,7 @@
 
 __global__ void sgemm_naive_f32_kernel(float* a, float* b, float* c, int M,
                                        int K, int N) {
-  // per threads calculation a small tile in c matrix.
+  // Each thread computes one element in C matrix
   const int m = blockDim.y * blockIdx.y + threadIdx.y;
   const int n = blockDim.x * blockIdx.x + threadIdx.x;
 
