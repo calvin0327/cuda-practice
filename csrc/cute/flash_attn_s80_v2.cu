@@ -809,18 +809,32 @@ static void launch_kernel(torch::Tensor& Q, torch::Tensor& K, torch::Tensor& V,
   // Total shared memory bytes needed
   int smem_size = (size_q + size_k + size_v) * sizeof(T);
 
+  int device_id;
+  CUDACHECK(cudaGetDevice(&device_id));
+  int max_smem_per_block_optin = 0;
+  CUDACHECK(cudaDeviceGetAttribute(&max_smem_per_block_optin,
+                                   cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                                   device_id));
+
+  if (smem_size > max_smem_per_block_optin) {
+    throw std::runtime_error(
+        "Requesting shared memory size (" + std::to_string(smem_size) +
+        ") exceeds device limit (" + std::to_string(max_smem_per_block_optin) +
+        "). Try reducing BlockQO/BlockKV.");
+  }
+
+  // Check if we need to increase the shared memory limit (default is usually
+  // 48KB)
+  if (smem_size >= 48 * 1024) {
+    CUDACHECK(cudaFuncSetAttribute(flash_attn_v2_kernel<config>,
+                                   cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                   smem_size));
+  }
+
   // Grid configuration: (batch, head, sequence_blocks)
   dim3 grid(b, h, n / BlockQO);
   // Block configuration: total threads per block
   dim3 block(config::NumThreads);
-
-  // Check if we need to increase the shared memory limit (default is usually
-  // 48KB)
-  if (smem_size > 48 * 1024) {
-    cudaFuncSetAttribute(flash_attn_v2_kernel<config>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         smem_size);
-  }
 
   // Pass smem_size as the 3rd argument
   flash_attn_v2_kernel<config><<<grid, block, smem_size>>>(
