@@ -33,13 +33,7 @@ def sgemm_t_8x8_shared_f32x4(a: Tensor, b: Tensor, c: Tensor) -> Tensor:
     return torch.ops._C.sgemm_t_8x8_shared_f32x4.default(a, b, c)
 
 
-def flash_attn_v2_cute_v1(Q: Tensor, K: Tensor, V: Tensor, causal: bool) -> Tensor:
+def flash_attn_v2_cute(Q: Tensor, K: Tensor, V: Tensor, is_causal: bool) -> Tensor:
     O = torch.zeros_like(Q)
-    torch.ops._C.flash_attn_v2_cute_v1(Q, K, V, O)
-    return O
-
-
-def flash_attn_v2_cute_v2(Q: Tensor, K: Tensor, V: Tensor, is_causal: bool) -> Tensor:
-    O = torch.zeros_like(Q)
-    torch.ops._C.flash_attn_v2_cute_v2(Q, K, V, O, is_causal)
+    torch.ops._C.flash_attn_v2_cute(Q, K, V, O, is_causal)
     return O

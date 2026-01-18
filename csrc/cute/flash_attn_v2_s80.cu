@@ -872,8 +872,8 @@ static void launch_kernel(torch::Tensor& Q, torch::Tensor& K, torch::Tensor& V,
 }
 
 // Main entry point: selects kernel configuration based on head dimension
-void flash_attn_v2_cute_v2(torch::Tensor& Q, torch::Tensor& K, torch::Tensor& V,
-                           torch::Tensor& O, bool is_causal = false) {
+void flash_attn_v2_cute(torch::Tensor& Q, torch::Tensor& K, torch::Tensor& V,
+                        torch::Tensor& O, bool is_causal = false) {
   CHECK_TORCH_TENSOR_DTYPE(Q, torch::kHalf)  // Q [B,H,N,D]
   CHECK_TORCH_TENSOR_DTYPE(K, torch::kHalf)  // K [B,H,N,D]
   CHECK_TORCH_TENSOR_DTYPE(V, torch::kHalf)  // V [B,H,N,D]

@@ -63,7 +63,7 @@ def benchmark(B, H, N_CTX, D, provider, causal):
     elif provider == "triton flash-attn-v2":
         fn = lambda: flash_attn_v2(q, k, v, causal)
     elif provider == "cute flash-attn-v2":
-        fn = lambda: ops.flash_attn_v2_cute_v2(q, k, v, causal)
+        fn = lambda: ops.flash_attn_v2_cute(q, k, v, causal)
     else:
         raise ValueError(f"Unknown provider: {provider}")
 

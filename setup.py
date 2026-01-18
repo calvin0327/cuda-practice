@@ -59,7 +59,7 @@ def get_extensions():
 
     cute_dir = os.path.join(extensions_dir, "cute")
     flash_attn_v2_sources = list(
-        glob.glob(os.path.join(cute_dir, "flash_attn_s80_*.cu")),
+        glob.glob(os.path.join(cute_dir, "flash_attn_v2_s80.cu")),
     )
 
     if use_cuda:
