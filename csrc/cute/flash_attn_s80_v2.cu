@@ -130,11 +130,12 @@ struct FlashAttnConfig {
 
   // MMA atom: 16x8x8 for simplicity (same layout for Q@K^T and S@V)
   using MMA_Atom = std::conditional_t<std::is_same_v<T, half_t>,
-                                      MMA_Atom<SM80_16x8x8_F32F16F16F32_TN>,
-                                      MMA_Atom<SM80_16x8x8_F32BF16BF16F32_TN>>;
+                                      MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>,
+                                      MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>>;
 
   // Tiled MMA: (16 * NWarpsPerSM) × 16 × 16 to cover BlockQO × BlockKV ×
   // HeadDim
+  // TODO: optimzie?
   using TiledMMA = decltype(make_tiled_mma(
       MMA_Atom{}, make_layout(Shape<Int<NWarpsPerSM>, _1, _1>{}, GenRowMajor{}),
       Tile<Int<16 * NWarpsPerSM>, _16, _16>{}));
@@ -652,21 +653,15 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
     update_running_max(max_i, max_ij);
 
     // Convert softmax scores to output type for matrix multiplication
-    // MMA may return F32, but we need to convert to T (half_t/bfloat16_t) for S
-    // @ V
-    auto tOrS = make_tensor<T>(tSrS.layout());
-    for (int i = 0; i < size(tOrS); ++i) {
-      tOrS(i) = static_cast<T>(tSrS(i));
-    }
-
-    // Compute attention-weighted values: O += softmax(S) @ V
-    // This accumulates the contribution from current KV block to output
-    // Assertion: This implementation assumes A and C have same layout
-    // This is only true for 16x8x8 MMA atoms, not for 16x8x16
-    static_assert(tiled_mma.get_layoutA_TV() == tiled_mma.get_layoutC_TV(),
-                  "This is only valid for atom mnk == (16, 8, 8), otherwise we "
-                  "will have different A and C layout and need to adjust the "
-                  "layout accordingly");
+    // MMA may return F32, but we need to convert to T (half_t/bfloat16_t)
+    // for S
+    // @ V. Additionally, for 16x8x16 atoms, the register layout of the
+    // Accumulator (C) differs from the Operand (A). We must re-partition S
+    // to match the A-layout.
+    auto tOrS = make_fragment_like(thr_mma.partition_fragment_A(
+        make_tensor(make_gmem_ptr((T*)nullptr),
+                    make_shape(Int<BlockQO>{}, Int<BlockKV>{}))));
+    copy(tSrS, tOrS);
 
     // Accumulate: O += softmax(S) @ V
     // This adds the attention-weighted values from current KV block to output
