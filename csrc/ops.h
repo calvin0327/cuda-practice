@@ -18,4 +18,4 @@ void flash_attn_v2_cute_v1(torch::Tensor& Q, torch::Tensor& K, torch::Tensor& V,
                            torch::Tensor& O);
 
 void flash_attn_v2_cute_v2(torch::Tensor& Q, torch::Tensor& K, torch::Tensor& V,
-                           torch::Tensor& O);
+                           torch::Tensor& O, bool is_causal);

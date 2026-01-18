@@ -344,7 +344,7 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
                                      typename FlashAttnConfig_::T* V_ptr,
                                      typename FlashAttnConfig_::T* O_ptr, int B,
                                      int H, int N_QO_CTX, int N_KV_CTX, int D,
-                                     float scaler) {
+                                     float scaler, bool is_causal) {
   // Extract data type from config
   using T = typename FlashAttnConfig_::T;
 
@@ -481,6 +481,9 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
   auto tSrS =
       partition_fragment_C(tiled_mma, Shape<Int<BlockQO>, Int<BlockKV>>{});
 
+  auto cS = make_identity_tensor(make_shape(Int<BlockQO>{}, Int<BlockKV>{}));
+  auto tScS = thr_mma.partition_fragment_C(cS);
+
   // Register fragments for output computation O = S @ V
   // V is transposed because MMA expects transposed B operand, but we want S @ V
   // V^T fragment: (MMA, Rep_HeadDim, Rep_KV, Stage)
@@ -591,7 +594,13 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
   auto l_i = make_tensor<float>(make_shape(_2{}, Int<size<1>(tSrS)>{}));
   fill(l_i, 0);
 
-  for (int blkKVIdx = 0; blkKVIdx < size<2>(gK); ++blkKVIdx) {
+  int k_block_max = size<2>(gK);
+  if (is_causal) {
+    k_block_max = (bz * BlockQO + BlockQO + BlockKV - 1) / BlockKV;
+    k_block_max = min(k_block_max, (int)size<2>(gK));
+  }
+
+  for (int blkKVIdx = 0; blkKVIdx < k_block_max; ++blkKVIdx) {
     int smem_read_idx = blkKVIdx % NStage;
     int smem_write_idx = (blkKVIdx + 1) % NStage;
 
@@ -603,8 +612,6 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
            tVsV(_, _, _, smem_write_idx));
       cp_async_fence();
     }
-
-    // TODO: Implement causal masking (for autoregressive models)
 
     // Clear attention scores for current KV block
     clear(tSrS);
@@ -625,6 +632,21 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
              tXrK(_, _, blkIdx + 1, 0));
       }
       gemm(tiled_mma, tSrQ(_, _, blkIdx), tSrK(_, _, blkIdx, 0), tSrS);
+    }
+
+    if (is_causal) {
+      int row_offset = bz * BlockQO;
+      int col_offset = blkKVIdx * BlockKV;
+      if (col_offset + BlockKV > row_offset) {
+        CUTE_UNROLL
+        for (int i = 0; i < size(tSrS); ++i) {
+          int global_row = row_offset + get<0>(tScS(i));
+          int global_col = col_offset + get<1>(tScS(i));
+          if (global_col > global_row) {
+            tSrS(i) = -INFINITY;
+          }
+        }
+      }
     }
 
     // Compute local maximum for current KV block
@@ -726,7 +748,6 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
   auto tOsO = thr_copy_to_gmem.partition_S(sO);
   auto tOgO = thr_copy_to_gmem.partition_D(gO);
 
-  // TODO: N % block = 0, so no mask needed
   copy(tiled_copy_to_gmem, tOsO, tOgO);
 }
 
@@ -777,7 +798,7 @@ static bool sanity_check(torch::Tensor& Q, torch::Tensor& K, torch::Tensor& V,
 // Launch kernel with specific configuration
 template <int BlockQO, int BlockKV, int HeadDim, int NWarpsPerSM, int Nstage>
 static void launch_kernel(torch::Tensor& Q, torch::Tensor& K, torch::Tensor& V,
-                          torch::Tensor& O) {
+                          torch::Tensor& O, bool is_causal) {
   using config =
       FlashAttnConfig<half_t, BlockQO, BlockKV, HeadDim, NWarpsPerSM, Nstage>;
 
@@ -840,18 +861,19 @@ static void launch_kernel(torch::Tensor& Q, torch::Tensor& K, torch::Tensor& V,
   dim3 block(config::NumThreads);
 
   // Pass smem_size as the 3rd argument
-  flash_attn_v2_kernel<config><<<grid, block, smem_size>>>(
-      reinterpret_cast<half_t*>(Q.data_ptr()),
-      reinterpret_cast<half_t*>(K.data_ptr()),
-      reinterpret_cast<half_t*>(V.data_ptr()),
-      reinterpret_cast<half_t*>(O.data_ptr()), b, h, n, n, d, scaler);
+  flash_attn_v2_kernel<config>
+      <<<grid, block, smem_size>>>(reinterpret_cast<half_t*>(Q.data_ptr()),
+                                   reinterpret_cast<half_t*>(K.data_ptr()),
+                                   reinterpret_cast<half_t*>(V.data_ptr()),
+                                   reinterpret_cast<half_t*>(O.data_ptr()), b,
+                                   h, n, n, d, scaler, is_causal);
 
   CUDACHECK(cudaGetLastError());
 }
 
 // Main entry point: selects kernel configuration based on head dimension
 void flash_attn_v2_cute_v2(torch::Tensor& Q, torch::Tensor& K, torch::Tensor& V,
-                           torch::Tensor& O) {
+                           torch::Tensor& O, bool is_causal = false) {
   CHECK_TORCH_TENSOR_DTYPE(Q, torch::kHalf)  // Q [B,H,N,D]
   CHECK_TORCH_TENSOR_DTYPE(K, torch::kHalf)  // K [B,H,N,D]
   CHECK_TORCH_TENSOR_DTYPE(V, torch::kHalf)  // V [B,H,N,D]
@@ -862,19 +884,19 @@ void flash_attn_v2_cute_v2(torch::Tensor& Q, torch::Tensor& K, torch::Tensor& V,
   // Select kernel configuration based on head dimension
   switch (d) {
     case 16:
-      launch_kernel<128, 128, 16, 8, 2>(Q, K, V, O);
+      launch_kernel<128, 128, 16, 8, 2>(Q, K, V, O, is_causal);
       break;
     case 32:
-      launch_kernel<128, 128, 32, 8, 2>(Q, K, V, O);
+      launch_kernel<128, 128, 32, 8, 2>(Q, K, V, O, is_causal);
       break;
     case 64:
-      launch_kernel<128, 128, 64, 8, 2>(Q, K, V, O);
+      launch_kernel<128, 128, 64, 8, 2>(Q, K, V, O, is_causal);
       break;
     case 128:
-      launch_kernel<64, 64, 128, 4, 2>(Q, K, V, O);
+      launch_kernel<64, 64, 128, 4, 2>(Q, K, V, O, is_causal);
       break;
     case 256:
-      launch_kernel<32, 32, 256, 2, 2>(Q, K, V, O);
+      launch_kernel<32, 32, 256, 2, 2>(Q, K, V, O, is_causal);
       break;
     default:
       throw std::runtime_error("Unsupported headdim");

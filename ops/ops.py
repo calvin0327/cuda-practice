@@ -39,7 +39,7 @@ def flash_attn_v2_cute_v1(Q: Tensor, K: Tensor, V: Tensor, causal: bool) -> Tens
     return O
 
 
-def flash_attn_v2_cute_v2(Q: Tensor, K: Tensor, V: Tensor, causal: bool) -> Tensor:
+def flash_attn_v2_cute_v2(Q: Tensor, K: Tensor, V: Tensor, is_causal: bool) -> Tensor:
     O = torch.zeros_like(Q)
-    torch.ops._C.flash_attn_v2_cute_v2(Q, K, V, O)
+    torch.ops._C.flash_attn_v2_cute_v2(Q, K, V, O, is_causal)
     return O

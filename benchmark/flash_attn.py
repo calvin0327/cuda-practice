@@ -10,8 +10,8 @@ from csrc.triton.flash_attn_v2 import flash_attn_v2
 def get_perf_config():
     batch, n_heads, head_dim = 4, 32, 64
     configs = []
-    # for causal in [True, False]:
-    for causal in [False]:
+    for causal in [True, False]:
+        # for causal in [False]:
         configs.append(
             triton.testing.Benchmark(
                 x_names=["N_CTX"],

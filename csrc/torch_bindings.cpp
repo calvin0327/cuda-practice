@@ -25,7 +25,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
   ops.def("flash_attn_v2_cute_v1(Tensor Q, Tensor K, Tensor V, Tensor O) ->()");
   ops.impl("flash_attn_v2_cute_v1", torch::kCUDA, &flash_attn_v2_cute_v1);
-  ops.def("flash_attn_v2_cute_v2(Tensor Q, Tensor K, Tensor V, Tensor O) ->()");
+  ops.def(
+      "flash_attn_v2_cute_v2(Tensor Q, Tensor K, Tensor V, Tensor O, bool "
+      "is_causal) ->()");
   ops.impl("flash_attn_v2_cute_v2", torch::kCUDA, &flash_attn_v2_cute_v2);
 }
 
