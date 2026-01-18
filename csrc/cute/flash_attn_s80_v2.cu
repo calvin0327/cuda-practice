@@ -605,7 +605,6 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
         copy(tiled_s2r_copy_Q, tXsQ(_, _, blkIdx + 1), tXrQ(_, _, blkIdx + 1));
         copy(tiled_s2r_copy_K, tXsK(_, _, blkIdx + 1), tXrK(_, _, blkIdx + 1));
       }
-
       gemm(tiled_mma, tSrQ(_, _, blkIdx), tSrK(_, _, blkIdx), tSrS);
     }
 
@@ -790,16 +789,46 @@ static void launch_kernel(torch::Tensor& Q, torch::Tensor& K, torch::Tensor& V,
 
   // TODO: Support arbitrary N values
   assert(n % BlockQO == 0);  // Sequence length must be divisible by block size
+  // In launch_kernel or the caller
+  if (n % BlockQO != 0) {
+    throw std::runtime_error(
+        "Sequence length must be multiple of block size (" +
+        std::to_string(BlockQO) +
+        ") for this kernel (head_dim=" + std::to_string(d) + ")");
+  }
+
+  // Calculate shared memory size required by the kernel
+  // sQ, sK, sV are needed. sO reuses sQ memory, sVt is a view of sV.
+  using T = typename config::T;
+
+  // Calculate size in elements (cosize returns the size of the domain)
+  int size_q = cosize(typename config::SmemLayoutQ{});
+  int size_k = cosize(typename config::SmemLayoutK{});
+  int size_v = cosize(typename config::SmemLayoutV{});
+
+  // Total shared memory bytes needed
+  int smem_size = (size_q + size_k + size_v) * sizeof(T);
 
   // Grid configuration: (batch, head, sequence_blocks)
   dim3 grid(b, h, n / BlockQO);
   // Block configuration: total threads per block
-  dim3 block(size(config::NumThreads));
-  flash_attn_v2_kernel<config><<<grid, block>>>(
+  dim3 block(config::NumThreads);
+
+  // Check if we need to increase the shared memory limit (default is usually
+  // 48KB)
+  if (smem_size > 48 * 1024) {
+    cudaFuncSetAttribute(flash_attn_v2_kernel<config>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         smem_size);
+  }
+
+  // Pass smem_size as the 3rd argument
+  flash_attn_v2_kernel<config><<<grid, block, smem_size>>>(
       reinterpret_cast<half_t*>(Q.data_ptr()),
       reinterpret_cast<half_t*>(K.data_ptr()),
       reinterpret_cast<half_t*>(V.data_ptr()),
       reinterpret_cast<half_t*>(O.data_ptr()), b, h, n, n, d, scaler);
+
   CUDACHECK(cudaGetLastError());
 }
 
