@@ -40,7 +40,7 @@ using namespace cute;
 //   HeadDim_: Head dimension (typically 16, 32, 64, 128, or 256)
 //   NWarpsPerSM_: Number of warps per streaming multiprocessor
 template <typename T_, int BlockQO_, int BlockKV_, int HeadDim_,
-          int NWarpsPerSM_>
+          int NWarpsPerSM_, int NStage_>
 struct FlashAttnConfig {
   using T = T_;
 
@@ -68,6 +68,7 @@ struct FlashAttnConfig {
   // Number of warps per SM and total threads per block
   static constexpr int NWarpsPerSM = NWarpsPerSM_;
   static constexpr int NumThreads = NWarpsPerSM * 32;  // 32 threads per warp
+  static constexpr int NStage = NStage_;
 
   // Block sizes for tiling
   static constexpr int BlockQO = BlockQO_;  // Block size for Q and O
@@ -97,10 +98,13 @@ struct FlashAttnConfig {
   using SmemLayoutO = decltype(tile_to_shape(
       SmemLayoutAtom{}, make_shape(Int<BlockQO>{}, Int<HeadDim>{})));
 
+  // Build mutil stage for K and V
   using SmemLayoutK = decltype(tile_to_shape(
-      SmemLayoutAtom{}, make_shape(Int<BlockKV>{}, Int<HeadDim>{})));
+      SmemLayoutAtom{},
+      make_shape(Int<BlockKV>{}, Int<HeadDim>{}, Int<NStage>{})));
   using SmemLayoutV = decltype(tile_to_shape(
-      SmemLayoutAtom{}, make_shape(Int<BlockKV>{}, Int<HeadDim>{})));
+      SmemLayoutAtom{},
+      make_shape(Int<BlockKV>{}, Int<HeadDim>{}, Int<NStage>{})));
 
   // Use GenColMajor to create transposed view of V
   using SmemLayoutAtomTranspose = decltype(composition(
@@ -109,7 +113,8 @@ struct FlashAttnConfig {
 
   // GenRowMajor refers to SmemLayoutAtomTranspose arrangement
   using SmemLayoutVt = decltype(tile_to_shape(
-      SmemLayoutAtomTranspose{}, make_shape(Int<HeadDim>{}, Int<BlockKV>{}),
+      SmemLayoutAtomTranspose{},
+      make_shape(Int<HeadDim>{}, Int<BlockKV>{}, Int<NStage>{}),
       GenRowMajor{}));
 
   static_assert(Int<NumThreads / GmemThreadsPerRow>::value <= BlockQO,
@@ -347,6 +352,7 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
   constexpr int BlockQO = FlashAttnConfig_::BlockQO;
   constexpr int BlockKV = FlashAttnConfig_::BlockKV;
   constexpr int HeadDim = FlashAttnConfig_::HeadDim;
+  constexpr int NStage = FlashAttnConfig_::NStage;
 
   // the tiledCopy to copy global memory to shared memory
   using TiledCopy = typename FlashAttnConfig_::TiledCopyQKVO;
@@ -436,12 +442,13 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
   auto tQgQ = gmem_thr_copy.partition_S(gQ);
   auto tQsQ = gmem_thr_copy.partition_D(sQ);
 
-  // (Copy, BlockKVCopy, HeadDimCopy, RestKV)
-  // (Copy, BlockKVCopy, HeadDimCopy, RestKV)
+  // (Copy, BlockKVCopy, HeadDimCopy, NumBlockKV)
+  // (Copy, BlockKVCopy, HeadDimCopy, NumBlockKV, Stage)
   auto tKgK = gmem_thr_copy.partition_S(gK);
   auto tKsK = gmem_thr_copy.partition_D(sK);
 
-  // (Copy, BlockKVCopy, HeadDimCopy, RestKV)
+  // (Copy, BlockKVCopy, HeadDimCopy, NumBlockKV)
+  // (Copy, BlockKVCopy, HeadDimCopy, NumBlockKV, Stage)
   auto tVgV = gmem_thr_copy.partition_S(gV);
   auto tVsV = gmem_thr_copy.partition_D(sV);
 
@@ -464,7 +471,7 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
 
   // Register fragments for Q and K (used in Q @ K^T computation)
   // Q fragment: (MMA, Rep_M, Rep_K)
-  // K fragment: (MMA, Rep_KV, Rep_K)
+  // K fragment: (MMA, Rep_KV, Rep_K, Stage)
   auto tSrQ = thr_mma.partition_fragment_A(sQ);
   auto tSrK = thr_mma.partition_fragment_B(sK);
 
@@ -475,7 +482,7 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
 
   // Register fragments for output computation O = S @ V
   // V is transposed because MMA expects transposed B operand, but we want S @ V
-  // V^T fragment: (MMA, Rep_HeadDim, Rep_KV)
+  // V^T fragment: (MMA, Rep_HeadDim, Rep_KV, Stage)
   auto tOrVt = thr_mma.partition_fragment_B(sVt);
 
   // O fragment: (MMA, Rep_M, Rep_HeadDim)
@@ -492,16 +499,18 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
   auto tiled_s2r_copy_K = make_tiled_copy_B(SmemCopyAtom{}, tiled_mma);
   auto thr_s2r_copy_K = tiled_s2r_copy_K.get_slice(tx);
   auto tXsK = thr_s2r_copy_K.partition_S(sK);
-  auto tXrK = thr_s2r_copy_K.retile_D(tSrK);  // (CPY, MMA_KV, MMA_HEAD)
+  auto tXrK = thr_s2r_copy_K.retile_D(tSrK);  // (CPY, MMA_KV, MMA_HEAD, Stage)
 
   auto tiled_s2r_copy_V = make_tiled_copy_B(SmemCopyAtom_T{}, tiled_mma);
   auto thr_s2r_copy_V = tiled_s2r_copy_V.get_slice(tx);
   auto tXsVt = thr_s2r_copy_V.partition_S(sVt);
-  auto tXrVt = thr_s2r_copy_V.retile_D(tOrVt);  // (CPY, MMA_Headdim, MMA_QO)
+  auto tXrVt =
+      thr_s2r_copy_V.retile_D(tOrVt);  // (CPY, MMA_Headdim, MMA_QO, Stage)
 
   // Step 7: Load and scale Q block: Q = Q / sqrt(head_dim)
   copy(gmem_tiled_copy, tQgQ, tQsQ);
-  copy(gmem_tiled_copy, tKgK(_, _, _, 0), tKsK);
+  copy(gmem_tiled_copy, tKgK(_, _, _, 0), tKsK(_, _, _, 0));
+  copy(gmem_tiled_copy, tVgV(_, _, _, 0), tVsV(_, _, _, 0));
   cp_async_fence();
 
   // Initialize output to zero (will accumulate results from each KV block)
@@ -582,40 +591,39 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
   fill(l_i, 0);
 
   for (int blkKVIdx = 0; blkKVIdx < size<2>(gK); ++blkKVIdx) {
+    int smem_read_idx = blkKVIdx % NStage;
+    int smem_write_idx = (blkKVIdx + 1) % NStage;
+
+    // async copy the next K and V to smem
+    if (blkKVIdx < size<2>(gK) - 1) {
+      copy(gmem_tiled_copy, tKgK(_, _, _, blkKVIdx + 1),
+           tKsK(_, _, _, smem_write_idx));
+      copy(gmem_tiled_copy, tVgV(_, _, _, blkKVIdx + 1),
+           tVsV(_, _, _, smem_write_idx));
+      cp_async_fence();
+    }
+
     // TODO: Implement causal masking (for autoregressive models)
 
     // Clear attention scores for current KV block
     clear(tSrS);
 
-    // wait current Q and K block from global memory to shared memory
-    cp_async_wait<0>();
+    // wait current Q and K and K block from global memory to shared memory
+    cp_async_wait<1>();
     __syncthreads();  // Ensure previous operations complete
-
-    // async copy current V to smem
-    copy(gmem_tiled_copy, tVgV(_, _, _, blkKVIdx), tVsV);
-    cp_async_fence();
 
     // Compute attention scores: S = Q @ K^T
     // Copy Q and K from shared memory to registers
     copy(tiled_s2r_copy_Q, tXsQ(_, _, 0), tXrQ(_, _, 0));
-    copy(tiled_s2r_copy_K, tXsK(_, _, 0), tXrK(_, _, 0));
+    copy(tiled_s2r_copy_K, tXsK(_, _, 0, smem_read_idx), tXrK(_, _, 0, 0));
     CUTE_UNROLL
     for (int blkIdx = 0; blkIdx < size<2>(tSrQ); blkIdx++) {
       if (blkIdx < size<2>(tSrQ) - 1) {
         copy(tiled_s2r_copy_Q, tXsQ(_, _, blkIdx + 1), tXrQ(_, _, blkIdx + 1));
-        copy(tiled_s2r_copy_K, tXsK(_, _, blkIdx + 1), tXrK(_, _, blkIdx + 1));
+        copy(tiled_s2r_copy_K, tXsK(_, _, blkIdx + 1, smem_read_idx),
+             tXrK(_, _, blkIdx + 1, 0));
       }
-      gemm(tiled_mma, tSrQ(_, _, blkIdx), tSrK(_, _, blkIdx), tSrS);
-    }
-
-    // wait block V to shared memory
-    cp_async_wait<0>();
-    __syncthreads();  // Ensure all threads finish loading K
-
-    // async copy the next K to smem
-    if (blkKVIdx < size<2>(gK) - 1) {
-      copy(gmem_tiled_copy, tKgK(_, _, _, blkKVIdx + 1), tKsK);
-      cp_async_fence();
+      gemm(tiled_mma, tSrQ(_, _, blkIdx), tSrK(_, _, blkIdx, 0), tSrS);
     }
 
     // Compute local maximum for current KV block
@@ -662,14 +670,14 @@ __global__ void flash_attn_v2_kernel(typename FlashAttnConfig_::T* Q_ptr,
 
     // Accumulate: O += softmax(S) @ V
     // This adds the attention-weighted values from current KV block to output
-    copy(tiled_s2r_copy_V, tXsVt(_, _, 0), tXrVt(_, _, 0));
+    copy(tiled_s2r_copy_V, tXsVt(_, _, 0, smem_read_idx), tXrVt(_, _, 0, 0));
     CUTE_UNROLL
     for (int blkIdx = 0; blkIdx < size<2>(tOrS); ++blkIdx) {
       if (blkIdx < size<2>(tOrS) - 1) {
-        copy(tiled_s2r_copy_V, tXsVt(_, _, blkIdx + 1),
-             tXrVt(_, _, blkIdx + 1));
+        copy(tiled_s2r_copy_V, tXsVt(_, _, blkIdx + 1, smem_read_idx),
+             tXrVt(_, _, blkIdx + 1, 0));
       }
-      gemm(tiled_mma, tOrS(_, _, blkIdx), tOrVt(_, _, blkIdx), tOrO);
+      gemm(tiled_mma, tOrS(_, _, blkIdx), tOrVt(_, _, blkIdx, 0), tOrO);
     }
 
 #ifdef FLASH_ATTN_MMA_DEBUG
@@ -772,11 +780,11 @@ static bool sanity_check(torch::Tensor& Q, torch::Tensor& K, torch::Tensor& V,
 }
 
 // Launch kernel with specific configuration
-template <int BlockQO, int BlockKV, int HeadDim, int NWarpsPerSM>
+template <int BlockQO, int BlockKV, int HeadDim, int NWarpsPerSM, int Nstage>
 static void launch_kernel(torch::Tensor& Q, torch::Tensor& K, torch::Tensor& V,
                           torch::Tensor& O) {
   using config =
-      FlashAttnConfig<half_t, BlockQO, BlockKV, HeadDim, NWarpsPerSM>;
+      FlashAttnConfig<half_t, BlockQO, BlockKV, HeadDim, NWarpsPerSM, Nstage>;
 
   assert(sanity_check(Q, K, V, O));
   const int b = Q.size(0);  // Batch size
@@ -859,19 +867,19 @@ void flash_attn_v2_cute_v2(torch::Tensor& Q, torch::Tensor& K, torch::Tensor& V,
   // Select kernel configuration based on head dimension
   switch (d) {
     case 16:
-      launch_kernel<128, 128, 16, 8>(Q, K, V, O);
+      launch_kernel<128, 128, 16, 8, 2>(Q, K, V, O);
       break;
     case 32:
-      launch_kernel<128, 128, 32, 8>(Q, K, V, O);
+      launch_kernel<128, 128, 32, 8, 2>(Q, K, V, O);
       break;
     case 64:
-      launch_kernel<128, 128, 64, 8>(Q, K, V, O);
+      launch_kernel<128, 128, 64, 8, 2>(Q, K, V, O);
       break;
     case 128:
-      launch_kernel<64, 64, 128, 4>(Q, K, V, O);
+      launch_kernel<64, 64, 128, 4, 2>(Q, K, V, O);
       break;
     case 256:
-      launch_kernel<32, 32, 256, 2>(Q, K, V, O);
+      launch_kernel<32, 32, 256, 2, 2>(Q, K, V, O);
       break;
     default:
       throw std::runtime_error("Unsupported headdim");
