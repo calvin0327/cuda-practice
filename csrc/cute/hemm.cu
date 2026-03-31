@@ -1,4 +1,3 @@
-#include <stdlib.h>
 #include <cstdio>
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -9,6 +8,17 @@
 #include <cute/util/print.hpp>
 
 #include "../utils.h"
+
+// 1. build gobal tensor
+// 2. local_tile 切块
+// 3. 创建 shared memory
+// 4. build shared tensor
+// 5. partition thread local
+// 6. partition compute tensor for every thread
+// 7. for
+// 8. load global tensor to shared memory
+// 9. gemm
+// 10. copy to global
 
 // Setup params for an NT HEMM
 template <class T, class ProblemShape, class CtaTiler>
