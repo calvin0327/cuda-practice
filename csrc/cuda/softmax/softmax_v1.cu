@@ -93,7 +93,7 @@ int main() {
 
   delete[] h_inp;
   delete[] h_out;
-  delete d_inp;
-  delete d_out;
+  cudaFree(d_inp);
+  cudaFree(d_out);
   return 0;
 }

@@ -3,11 +3,33 @@
 
 #include "cuda_runtime.h"
 
-__global__ void softmax_kernel_v2(const float* input, float* output, int M,
+__device__ float warp_reduce_max(float max) {
+  max = fmaxf(max, __shfl_xor_sync(0xFFFFFFFF, max, 16));
+  max = fmaxf(max, __shfl_xor_sync(0xFFFFFFFF, max, 8));
+  max = fmaxf(max, __shfl_xor_sync(0xFFFFFFFF, max, 4));
+  max = fmaxf(max, __shfl_xor_sync(0xFFFFFFFF, max, 2));
+  max = fmaxf(max, __shfl_xor_sync(0xFFFFFFFF, max, 1));
+  return max;
+}
+
+__device__ float warp_reduce_sum(float sum) {
+  sum += __shfl_xor_sync(0xFFFFFFFF, sum, 16);
+  sum += __shfl_xor_sync(0xFFFFFFFF, sum, 8);
+  sum += __shfl_xor_sync(0xFFFFFFFF, sum, 4);
+  sum += __shfl_xor_sync(0xFFFFFFFF, sum, 2);
+  sum += __shfl_xor_sync(0xFFFFFFFF, sum, 1);
+  return sum;
+}
+
+__global__ void softmax_kernel_v4(const float* input, float* output, int M,
                                   int N) {
   int tid = threadIdx.x;
   int bid = blockIdx.x;
   int block_size = blockDim.x;  // 128 threads, every thread handles 32 elements
+
+  int laneId = tid % 32;
+  int warpId = tid / 32;
+  int nums_warp = block_size / 32;
 
   const float* input_raw = input + bid * N;
   float* output_raw = output + bid * N;
@@ -19,23 +41,17 @@ __global__ void softmax_kernel_v2(const float* input, float* output, int M,
   for (int i = tid; i < N; i += block_size) {
     maxval = fmaxf(maxval, input_raw[i]);
   }
-  smem[tid] = maxval;
+
+  maxval = warp_reduce_max(maxval);
+  if (laneId == 0) {
+    smem[warpId] = maxval;
+  }
   __syncthreads();
 
-  for (int stride = block_size / 2; stride > 32; stride /= 2) {
-    if (tid < stride) {
-      smem[tid] = fmaxf(smem[tid], smem[tid + stride]);
-    }
-    __syncthreads();
-  }
-  if (tid < 32) {
-    volatile float* v = smem;
-    v[tid] = fmaxf(v[tid], v[tid + 32]);
-    v[tid] = fmaxf(v[tid], v[tid + 16]);
-    v[tid] = fmaxf(v[tid], v[tid + 8]);
-    v[tid] = fmaxf(v[tid], v[tid + 4]);
-    v[tid] = fmaxf(v[tid], v[tid + 2]);
-    v[tid] = fmaxf(v[tid], v[tid + 1]);
+  maxval = tid < nums_warp ? smem[tid] : -1e20f;
+  maxval = warp_reduce_max(maxval);
+  if (tid == 0) {
+    smem[0] = maxval;
   }
   __syncthreads();
   maxval = smem[0];
@@ -45,23 +61,17 @@ __global__ void softmax_kernel_v2(const float* input, float* output, int M,
   for (int i = tid; i < N; i += block_size) {
     sumval += expf(input_raw[i] - maxval);
   }
-  smem[tid] = sumval;
+
+  sumval = warp_reduce_sum(sumval);
+  if (laneId == 0) {
+    smem[warpId] = sumval;
+  }
   __syncthreads();
 
-  for (int stride = block_size / 2; stride > 32; stride /= 2) {
-    if (tid < stride) {
-      smem[tid] += smem[tid + stride];
-    }
-    __syncthreads();
-  }
-  if (tid < 32) {
-    volatile float* v = smem;
-    v[tid] += v[tid + 32];
-    v[tid] += v[tid + 16];
-    v[tid] += v[tid + 8];
-    v[tid] += v[tid + 4];
-    v[tid] += v[tid + 2];
-    v[tid] += v[tid + 1];
+  sumval = tid < nums_warp ? smem[tid] : 0.f;
+  sumval = warp_reduce_sum(sumval);
+  if (tid == 0) {
+    smem[0] = sumval;
   }
   __syncthreads();
   sumval = smem[0];
@@ -93,7 +103,7 @@ int main() {
 
   dim3 grid(M);                     // handle a row of elements peer block
   dim3 block((N + 128 - 1) / 128);  // handle 32 elements peer thread
-  softmax_kernel_v2<<<grid, block>>>(d_inp, d_out, M, N);
+  softmax_kernel_v4<<<grid, block>>>(d_inp, d_out, M, N);
 
   cudaDeviceSynchronize();
   cudaMemcpy(h_out, d_out, size * sizeof(float), cudaMemcpyDeviceToHost);

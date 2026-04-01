@@ -71,7 +71,7 @@ int main() {
 
   delete[] h_input;
   delete[] h_output;
-  delete d_input;
-  delete d_output;
+  cudaFree(d_input);
+  cudaFree(d_output);
   return 0;
 }
