@@ -14,7 +14,7 @@ First row sum: 0.100000 (expected: 1)
     SM Frequency                    Mhz       884.99
     Elapsed Cycles                cycle    2,756,783
     Memory Throughput                 %        56.42
-    DRAM Throughput                   %        32.43
+    DRAM Throughput                   %        32.44
     Duration                         ms         3.12
     L1/TEX Cache Throughput           %        73.65
     L2 Cache Throughput               %        56.42

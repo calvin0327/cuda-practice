@@ -119,8 +119,8 @@ int main() {
 
   cudaMemcpy(d_inp, h_inp, size * sizeof(float), cudaMemcpyHostToDevice);
 
-  dim3 grid(M);                     // handle a row of elements peer block
-  dim3 block((N + 128 - 1) / 128);  // handle 32 elements peer thread
+  dim3 grid(M);                   // handle a row of elements peer block
+  dim3 block((N + 32 - 1) / 32);  // handle 32 elements peer thread
   const int num_elements_per_thread = 8;
 
   softmax_kernel_v5<num_elements_per_thread>
